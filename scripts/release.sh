@@ -90,7 +90,7 @@ fi
 
 COMMITTED_VERSION="$(
   git show "HEAD:$TOOLBOX" |
-    awk -F'"' '/^VERSION="/ {print $2; exit}'
+    awk -F'"' '/^VERSION="/ && !found {print $2; found=1}'
 )"
 [[ "$COMMITTED_VERSION" == "$VERSION" ]] \
   || die "Committed toolbox VERSION is '$COMMITTED_VERSION', expected '$VERSION'."
