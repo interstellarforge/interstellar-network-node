@@ -61,16 +61,16 @@ path = Path(sys.argv[1])
 version = sys.argv[2]
 text = path.read_text()
 new, count = re.subn(
-    r'^VERSION="[^"]+"$',
-    f'VERSION="{version}"',
+    r'^TOOLBOX_VERSION="[^"]+"$',
+    f'TOOLBOX_VERSION="{version}"',
     text,
     count=1,
     flags=re.M,
 )
 if count != 1:
-    raise SystemExit("Could not find toolbox VERSION.")
+    raise SystemExit("Could not find toolbox TOOLBOX_VERSION.")
 path.write_text(new)
-print(f"Toolbox VERSION -> {version}")
+print(f"Toolbox TOOLBOX_VERSION -> {version}")
 PY
 
 info "Validating toolbox"
@@ -90,10 +90,10 @@ fi
 
 COMMITTED_VERSION="$(
   git show "HEAD:$TOOLBOX" |
-    awk -F'"' '/^VERSION="/ && !found {print $2; found=1}'
+    awk -F'"' '/^TOOLBOX_VERSION="/ && !found {print $2; found=1}'
 )"
 [[ "$COMMITTED_VERSION" == "$VERSION" ]] \
-  || die "Committed toolbox VERSION is '$COMMITTED_VERSION', expected '$VERSION'."
+  || die "Committed toolbox TOOLBOX_VERSION is '$COMMITTED_VERSION', expected '$VERSION'."
 
 info "Pushing ${BRANCH}"
 git push "$REMOTE" "$BRANCH"

@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Supports Debian and Ubuntu.
 # Start without arguments for the interactive menu.
 
-VERSION="4.3.2"
+TOOLBOX_VERSION="4.3.2"
 BACKUP_DIR="/var/backups/interstellar-toolbox"
 SSH_DROPIN="/etc/ssh/sshd_config.d/99-interstellar-hardening.conf"
 MANAGER_INSTALL_PATH="/usr/local/sbin/interstellar-toolbox"
@@ -47,7 +47,7 @@ if ! command -v whiptail >/dev/null 2>&1; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y whiptail
 fi
 
-UI_BACKTITLE="Interstellar Network Toolbox v${VERSION} | $(hostname)"
+UI_BACKTITLE="Interstellar Network Toolbox v${TOOLBOX_VERSION} | $(hostname)"
 
 ui_menu() {
   local title="$1" text="$2"
@@ -131,7 +131,7 @@ header() {
          ..  .. .  .       ..    .              .
 EOF
   printf '\n%sInterstellar Network Toolbox%s v%s | %s | %s\n\n' \
-    "$BOLD" "$RESET" "$VERSION" "$(hostname)" "${PRETTY_NAME:-Linux}"
+    "$BOLD" "$RESET" "$TOOLBOX_VERSION" "$(hostname)" "${PRETTY_NAME:-Linux}"
 }
 
 confirm() {
@@ -2856,7 +2856,7 @@ manager_latest_release_version() {
 manager_release_status() {
   clear
   echo "Interstellar Network Toolbox"
-  echo "  Installed version: ${VERSION}"
+  echo "  Installed version: ${TOOLBOX_VERSION}"
   echo "  Release repository: https://github.com/${RELEASE_REPO}"
   echo
 
@@ -2870,13 +2870,13 @@ manager_release_status() {
   echo "  Latest release:    ${latest}"
   echo
 
-  if dpkg --compare-versions "$latest" gt "$VERSION"; then
-    warn "Update available: ${VERSION} -> ${latest}"
+  if dpkg --compare-versions "$latest" gt "$TOOLBOX_VERSION"; then
+    warn "Update available: ${TOOLBOX_VERSION} -> ${latest}"
     return 2
-  elif dpkg --compare-versions "$latest" eq "$VERSION"; then
+  elif dpkg --compare-versions "$latest" eq "$TOOLBOX_VERSION"; then
     ok "Toolbox is up to date."
   else
-    info "Installed version ${VERSION} is newer than the latest published release ${latest}."
+    info "Installed version ${TOOLBOX_VERSION} is newer than the latest published release ${latest}."
   fi
 }
 
@@ -2887,15 +2887,15 @@ manager_update_latest() {
     return 1
   }
 
-  if ! dpkg --compare-versions "$latest" gt "$VERSION"; then
-    ui_msg "Interstellar Network" "Installed: ${VERSION}\nLatest: ${latest}\n\nNo newer release is available."
+  if ! dpkg --compare-versions "$latest" gt "$TOOLBOX_VERSION"; then
+    ui_msg "Interstellar Network" "Installed: ${TOOLBOX_VERSION}\nLatest: ${latest}\n\nNo newer release is available."
     return 0
   fi
 
   if ! ui_yesno "Update Interstellar Network" \
 "Update the Interstellar Network Toolbox?
 
-Current: ${VERSION}
+Current: ${TOOLBOX_VERSION}
 Latest:  ${latest}
 
 The release is downloaded from:
@@ -3003,7 +3003,7 @@ manager_security_menu() {
 https://github.com/${RELEASE_REPO}
 
 Installed toolbox:
-${VERSION}
+${TOOLBOX_VERSION}
 
 Release assets:
 ${RELEASE_ASSET}
@@ -3083,7 +3083,7 @@ system_menu() {
         new_hostname="$(ui_input "Hostname" "Enter new hostname:" "$(hostname)")" || continue
         if [[ "$new_hostname" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
           hostnamectl set-hostname "$new_hostname"
-          UI_BACKTITLE="Interstellar Network Toolbox v${VERSION} | $(hostname)"
+          UI_BACKTITLE="Interstellar Network Toolbox v${TOOLBOX_VERSION} | $(hostname)"
           ui_msg "Hostname" "Hostname changed to $new_hostname."
         else
           ui_msg "Invalid hostname" "The supplied hostname is invalid."
