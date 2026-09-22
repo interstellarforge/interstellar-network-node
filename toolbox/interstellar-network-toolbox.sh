@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Supports Debian and Ubuntu.
 # Start without arguments for the interactive menu.
 
-TOOLBOX_VERSION="4.3.3"
+TOOLBOX_VERSION="4.5.0"
 BACKUP_DIR="/var/backups/interstellar-toolbox"
 SSH_DROPIN="/etc/ssh/sshd_config.d/99-interstellar-hardening.conf"
 MANAGER_INSTALL_PATH="/usr/local/sbin/interstellar-toolbox"
@@ -902,6 +902,7 @@ tailscale_menu() {
       "4" "Disconnect Tailscale" \
       "5" "Show network information" \
       "6" "Show Tailscale Serve status" \
+      "7" "Wake-on-LAN" \
       "0" "Back")" || return
     case "$choice" in
       1) clear; tailscale_status_show; pause ;;
@@ -910,6 +911,7 @@ tailscale_menu() {
       4) clear; command -v tailscale >/dev/null 2>&1 && tailscale down; pause ;;
       5) clear; network_info; pause ;;
       6) clear; tailscale serve status 2>/dev/null || true; pause ;;
+      7) wol_menu ;;
       0) return ;;
     esac
   done
@@ -1470,6 +1472,244 @@ MDNS_PY="${AGENT_DIR}/mdns.py"
 MDNS_ENV="/etc/default/interstellar-mdns"
 MDNS_UNIT="/etc/systemd/system/interstellar-mdns.service"
 
+CONTROL_API_PY="${AGENT_DIR}/control-api.py"
+CONTROL_API_UNIT="/etc/systemd/system/interstellar-control-api.service"
+
+CONTROL_HELPER_PY="${AGENT_DIR}/control-helper.py"
+CONTROL_HELPER_UNIT="/etc/systemd/system/interstellar-control-helper.service"
+CONTROL_POLICY="/etc/interstellar/control-policy.json"
+WOL_PY="${AGENT_DIR}/wol.py"
+WOL_UNIT="/etc/systemd/system/interstellar-wol.service"
+
+write_wol_python() {
+  install -d -o root -g root -m 0755 "$AGENT_DIR"
+  cat >"$WOL_PY" <<'PYEOF'
+#!/usr/bin/env python3
+"""Apply only a validated, root-configured magic-packet WoL setting."""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+NET = Path("/sys/class/net")
+CONFIG = Path("/etc/interstellar/wol.json")
+ETHTOOL = "/usr/sbin/ethtool"
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}\Z")
+MAC = re.compile(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\Z")
+
+
+def physical(name):
+    return bool(NAME.fullmatch(name) and (NET / name / "device").exists())
+
+
+def interfaces():
+    return [p.name for p in sorted(NET.iterdir()) if physical(p.name)]
+
+
+def details(name):
+    if not physical(name):
+        raise ValueError("Interface is not a physical network interface")
+    mac = (NET / name / "address").read_text().strip().lower()
+    if not MAC.fullmatch(mac) or mac == "00:00:00:00:00:00":
+        raise ValueError("Interface has no valid MAC address")
+    proc = subprocess.run([ETHTOOL, name], capture_output=True, text=True, timeout=5, check=False)
+    if proc.returncode:
+        raise ValueError("Cannot read Wake-on-LAN capabilities")
+    supports = re.search(r"^\s*Supports Wake-on:\s*(\S+)", proc.stdout, re.M)
+    current = re.search(r"^\s*Wake-on:\s*(\S+)", proc.stdout, re.M)
+    return {"interface": name, "mac_address": mac,
+            "supported": bool(supports and "g" in supports.group(1)),
+            "enabled": bool(current and "g" in current.group(1)),
+            "supports_modes": supports.group(1) if supports else "unknown",
+            "current_modes": current.group(1) if current else "unknown"}
+
+
+def config():
+    try:
+        value = json.loads(CONFIG.read_text())
+    except FileNotFoundError:
+        return {"enabled": False, "interface": None, "mac_address": None}
+    if not isinstance(value, dict) or not isinstance(value.get("enabled"), bool):
+        raise ValueError("Invalid WoL configuration")
+    name, mac = value.get("interface"), value.get("mac_address")
+    if not isinstance(name, str) or not NAME.fullmatch(name) or not isinstance(mac, str) or not MAC.fullmatch(mac):
+        raise ValueError("Invalid WoL interface or MAC")
+    return value
+
+
+def save(value):
+    CONFIG.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=CONFIG.parent, delete=False) as handle:
+        json.dump(value, handle, indent=2)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    try:
+        os.chmod(temporary, 0o644)
+        os.chown(temporary, 0, 0)
+        os.replace(temporary, CONFIG)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def virtual_machine():
+    try:
+        return subprocess.run(["/usr/bin/systemd-detect-virt", "--vm"],
+                              capture_output=True, timeout=3, check=False).returncode == 0
+    except OSError:
+        return False
+
+
+def apply(name, expected_mac):
+    value = details(name)
+    if value["mac_address"] != expected_mac or not value["supported"]:
+        raise ValueError("Configured NIC changed or magic-packet wake is unsupported")
+    proc = subprocess.run([ETHTOOL, "-s", name, "wol", "g"],
+                          capture_output=True, timeout=5, check=False)
+    if proc.returncode:
+        raise RuntimeError("Failed to enable magic-packet wake")
+
+
+def main(argv):
+    if len(argv) not in (1, 2) or argv[0] not in {"list", "status", "select", "enable", "disable", "apply", "test"}:
+        raise ValueError("Unsupported WoL operation")
+    action = argv[0]
+    if action == "list":
+        for name in interfaces():
+            try:
+                value = details(name)
+                print(f'{name}\t{value["mac_address"]}\t{"magic packet" if value["supported"] else "unsupported"}')
+            except (OSError, ValueError):
+                print(f"{name}\tunknown\tunavailable")
+        return
+    selected = config()
+    if action == "select":
+        if len(argv) != 2 or selected["enabled"]:
+            raise ValueError("Disable WoL before selecting another interface")
+        value = details(argv[1])
+        if not value["supported"]:
+            raise ValueError("Selected NIC does not support magic-packet wake")
+        save({"enabled": False, "interface": argv[1], "mac_address": value["mac_address"]})
+        print(f'Selected {argv[1]} ({value["mac_address"]})')
+        return
+    if len(argv) != 1:
+        raise ValueError("Unexpected WoL argument")
+    name = selected["interface"]
+    if action in {"enable", "apply"}:
+        if not name:
+            raise ValueError("Select a physical interface first")
+        if virtual_machine():
+            raise ValueError("This is a VM; configure power-on at the hypervisor instead")
+        if action == "apply" and not selected["enabled"]:
+            raise ValueError("WoL is not configured as enabled")
+        if action == "apply":
+            for _ in range(30):
+                if physical(name):
+                    break
+                time.sleep(1)
+        apply(name, selected["mac_address"])
+        if action == "enable":
+            save({**selected, "enabled": True})
+        print("Magic-packet wake enabled")
+        return
+    if action == "disable":
+        if name:
+            save({**selected, "enabled": False})
+        if name and physical(name):
+            proc = subprocess.run([ETHTOOL, "-s", name, "wol", "d"],
+                                  capture_output=True, timeout=5, check=False)
+            if proc.returncode:
+                raise RuntimeError("Persistence disabled, but the current NIC setting could not be changed")
+        print("Magic-packet wake disabled")
+        return
+    value = details(name) if name else None
+    persistent = subprocess.run(["/usr/bin/systemctl", "is-enabled", "interstellar-wol.service"],
+                                capture_output=True, timeout=5, check=False).returncode == 0
+    if action == "test":
+        if not selected["enabled"] or not persistent or not value or not value["enabled"] or value["mac_address"] != selected["mac_address"]:
+            raise ValueError("WoL configuration is not active and persistent")
+        print("WoL is active and configured for reboot persistence")
+        return
+    print(f'Interface:       {name or "none"}')
+    print(f'MAC:             {selected["mac_address"] or "unknown"}')
+    print(f'WoL supported:   {"yes" if value and value["supported"] else "no"}')
+    print(f'Magic packet:    {"supported" if value and value["supported"] else "unsupported"}')
+    print(f'WoL enabled:     {"yes" if value and value["enabled"] else "no"}')
+    print(f'Persistent:      {"yes" if selected["enabled"] and persistent else "no"}')
+    if virtual_machine():
+        print("VM detected: WoL from the guest cannot be relied on; use hypervisor power controls.")
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"WoL: {error}", file=sys.stderr)
+        raise SystemExit(1)
+PYEOF
+  chown root:root "$WOL_PY"
+  chmod 0755 "$WOL_PY"
+}
+
+write_wol_unit() {
+  cat >"$WOL_UNIT" <<'EOF'
+[Unit]
+Description=Interstellar Network Wake-on-LAN persistence
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /usr/local/lib/interstellar/wol.py apply
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chown root:root "$WOL_UNIT"
+  chmod 0644 "$WOL_UNIT"
+}
+
+wol_menu() {
+  install_pkg ethtool
+  write_wol_python
+  write_wol_unit
+  systemctl daemon-reload
+  while true; do
+    local choice selected
+    choice="$(ui_menu "Wake-on-LAN" "Configure magic-packet wake for a physical NIC." \
+      "1" "Show status" \
+      "2" "Enable Wake-on-LAN" \
+      "3" "Disable Wake-on-LAN" \
+      "4" "Select interface" \
+      "5" "Show MAC address / interfaces" \
+      "6" "Test persistence / configuration" \
+      "0" "Back")" || return
+    case "$choice" in
+      1) clear; python3 "$WOL_PY" status; pause ;;
+      2) clear; if python3 "$WOL_PY" enable; then systemctl enable --now interstellar-wol.service; fi; pause ;;
+      3) clear; systemctl disable --now interstellar-wol.service 2>/dev/null || true; python3 "$WOL_PY" disable; pause ;;
+      4) clear; python3 "$WOL_PY" list; selected="$(ui_input "WoL interface" "Enter a listed physical interface name:")" || continue; python3 "$WOL_PY" select "$selected"; pause ;;
+      5) clear; python3 "$WOL_PY" list; python3 "$WOL_PY" status; pause ;;
+      6) clear; python3 "$WOL_PY" test; pause ;;
+      0) return ;;
+    esac
+  done
+}
+
 write_agent_python() {
   install -d -o root -g root -m 0755 "$AGENT_DIR"
   cat >"$AGENT_PY" <<'PYEOF'
@@ -1477,9 +1717,11 @@ write_agent_python() {
 from __future__ import annotations
 
 import glob
+import ipaddress
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -1488,7 +1730,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-VERSION = "3.0.0"
+VERSION = "3.2.0"
 BIND = "127.0.0.1"
 PORT = int(os.environ.get("INTERSTELLAR_PORT", "9127"))
 ROLES = [x.strip() for x in os.environ.get("INTERSTELLAR_ROLES", "general").split(",") if x.strip()]
@@ -1516,7 +1758,7 @@ APT = which("apt", ("/usr/bin/apt",))
 
 _previous_network: dict[str, tuple[float, int, int]] = {}
 _previous_disk: dict[str, tuple[float, int, int]] = {}
-_apt_cache: tuple[float, dict[str, Any]] | None = None
+_apt_cache: tuple[float, tuple[float | None, float | None], dict[str, Any]] | None = None
 
 
 def run(cmd: list[str], timeout: float = 3.0) -> str:
@@ -1993,10 +2235,9 @@ def failed_units() -> list[dict[str, str]]:
         parts = line.split()
         if not parts:
             continue
-        unit = parts[0].lstrip("●")
-        if unit == "●" and len(parts) > 1:
-            unit = parts[1]
-        result.append({"unit": unit})
+        unit = parts[1] if parts[0] == "●" and len(parts) > 1 else parts[0].lstrip("●")
+        if unit:
+            result.append({"unit": unit})
     return result
 
 
@@ -2049,8 +2290,11 @@ def last_apt_history_end() -> str | None:
 def package_update_stats() -> dict[str, Any]:
     global _apt_cache
     monotonic_now = time.monotonic()
-    if _apt_cache and monotonic_now - _apt_cache[0] < APT_CACHE_SECONDS:
-        return _apt_cache[1]
+    last_cache = newest_mtime(["/var/lib/apt/lists/*"])
+    last_package_change = newest_mtime(["/var/lib/dpkg/status"])
+    fingerprint = (last_cache, last_package_change)
+    if _apt_cache and monotonic_now - _apt_cache[0] < APT_CACHE_SECONDS and _apt_cache[1] == fingerprint:
+        return _apt_cache[2]
 
     output = run([APT, "list", "--upgradable"], timeout=12.0)
     packages: list[dict[str, Any]] = []
@@ -2064,20 +2308,21 @@ def package_update_stats() -> dict[str, Any]:
         name_repo = parts[0]
         package_name, repo = name_repo.split("/", 1)
         version = parts[1] if len(parts) > 1 else None
-        is_security = "security" in repo.lower() or "security" in line.lower()
+        is_security = "security" in repo.lower()
         if is_security:
             security += 1
         packages.append(
             {
                 "name": package_name,
                 "version": version,
+                "available_version": version,
+                "installed_version": (line.split("[upgradable from: ", 1)[1].split("]", 1)[0]
+                                      if "[upgradable from: " in line else None),
                 "repository": repo,
                 "security": is_security,
             }
         )
 
-    last_cache = newest_mtime(["/var/lib/apt/lists/*"])
-    last_package_change = newest_mtime(["/var/lib/dpkg/status"])
     result = {
         "pending": len(packages),
         "pending_security": security,
@@ -2087,30 +2332,121 @@ def package_update_stats() -> dict[str, Any]:
         "last_successful_update_utc": last_apt_history_end() or iso_from_timestamp(last_package_change),
         "cache_seconds": APT_CACHE_SECONDS,
     }
-    _apt_cache = (monotonic_now, result)
+    _apt_cache = (monotonic_now, fingerprint, result)
     return result
 
 
+def tailscale_status() -> dict[str, Any]:
+    version = run([TAILSCALE, "version"], timeout=3.0).splitlines()
+    installed = version[0] if version else None
+    try:
+        data = json.loads(run([TAILSCALE, "status", "--json"], timeout=3.0))
+    except (ValueError, TypeError):
+        return {"connected": False, "version": installed, "daemon_version": None}
+    self_node = data.get("Self") or {}
+    serve = run([TAILSCALE, "serve", "status"], timeout=3.0)
+    return {"connected": data.get("BackendState") == "Running",
+            "version": installed,
+            "daemon_version": data.get("Version"),
+            "magicdns_name": str(self_node.get("DNSName") or "").rstrip(".") or None,
+            "serve_enabled": bool(serve and "No serve config" not in serve)}
+
+
+def control_plane_status(tailscale: dict[str, Any], services: dict[str, str]) -> dict[str, Any]:
+    raw = tailscale.get("version") or ""
+    daemon = tailscale.get("daemon_version") or ""
+    def supported(value: str, daemon_version: bool = False) -> bool:
+        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", value)
+        if not match:
+            return False
+        version = tuple(int(match.group(i)) for i in (1, 2, 3))
+        suffix = match.group(4)
+        release_hashes = bool(daemon_version and suffix and re.fullmatch(r"[tg]?[0-9a-f]{6,}(?:-[tg]?[0-9a-f]{6,})?", suffix))
+        return version > (1, 98, 9) or version == (1, 98, 9) and (not suffix or release_hashes)
+    valid = supported(raw) and supported(daemon, True)
+    reason = None
+    if not valid:
+        reason = "Tailscale CLI and running daemon must both be 1.98.9 or newer"
+    elif services.get("interstellar-control-api") != "active":
+        reason = "Control API is not active"
+    return {"control_available": reason is None, "control_unavailable_reason": reason,
+            "tailscale_version": raw or None, "tailscale_daemon_version": daemon or None,
+            "tailscale_control_minimum_version": "1.98.9"}
+
+
+def wake_on_lan_stats() -> dict[str, Any]:
+    result = {"supported": False, "enabled": False, "interface": None, "mac_address": None}
+    try:
+        with open("/etc/interstellar/wol.json", encoding="utf-8") as handle:
+            config = json.load(handle)
+        if not isinstance(config, dict) or not isinstance(config.get("enabled"), bool):
+            return result
+        name = config.get("interface")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}", name):
+            return result
+        if not os.path.exists(f"/sys/class/net/{name}/device"):
+            return result
+        mac = read_text(f"/sys/class/net/{name}/address")
+        if not mac or not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", mac.lower()):
+            return result
+        if mac.lower() != config.get("mac_address"):
+            return result
+        result.update({"interface": name, "mac_address": mac.lower()})
+        output = run([which("ethtool", ("/usr/sbin/ethtool",)), name], timeout=3.0)
+        modes = re.search(r"^\s*Supports Wake-on:\s*(\S+)", output, re.M)
+        current = re.search(r"^\s*Wake-on:\s*(\S+)", output, re.M)
+        result["supported"] = bool(modes and "g" in modes.group(1))
+        result["enabled"] = bool(config["enabled"] and current and "g" in current.group(1) and result["supported"])
+        if virtualization() != "none":
+            result["supported"] = False
+            result["enabled"] = False
+            result["unavailable_reason"] = "Virtualized NIC wake cannot be verified from the guest"
+        try:
+            addr = json.loads(run([IP, "-j", "-4", "addr", "show", "dev", name], timeout=3.0))
+            broadcasts = [x.get("broadcast") for item in addr for x in item.get("addr_info", [])
+                          if x.get("family") == "inet" and x.get("scope") == "global" and x.get("broadcast")]
+            if len(broadcasts) == 1:
+                candidate = ipaddress.IPv4Address(broadcasts[0])
+                if not (candidate.is_multicast or candidate.is_loopback or candidate.is_unspecified):
+                    result["broadcast_address"] = str(candidate)
+        except (ValueError, TypeError, KeyError):
+            pass
+    except (OSError, ValueError, TypeError):
+        pass
+    return result
+
+
+def control_policy() -> dict[str, Any]:
+    try:
+        with open("/etc/interstellar/control-policy.json", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def role_metadata() -> dict[str, Any]:
-    role_defaults: dict[str, list[str]] = {
-        "docker-host": ["docker"],
-    }
-    effective = list(dict.fromkeys(EXPECTED_SERVICES))
-    for role in ROLES:
-        for service in role_defaults.get(role, []):
-            if service not in effective:
-                effective.append(service)
+    policy = control_policy()
+    expected = policy.get("expected_services")
+    if not isinstance(expected, list):
+        expected = EXPECTED_SERVICES
+    manageable = policy.get("manageable_services")
+    if not isinstance(manageable, list):
+        manageable = []
     return {
         "roles": ROLES,
-        "configured_expected_services": EXPECTED_SERVICES,
-        "expected_services": effective,
+        "configured_expected_services": expected,
+        "expected_services": list(dict.fromkeys(expected)),
+        "manageable_services": list(dict.fromkeys(manageable)),
     }
 
 
 def service_stats() -> tuple[dict[str, str], list[dict[str, str]]]:
     metadata = role_metadata()
-    names = ["ssh", "tailscaled", "docker", "qemu-guest-agent", "systemd-timesyncd"]
+    names = ["ssh", "tailscaled", "docker", "qemu-guest-agent", "systemd-timesyncd",
+             "interstellar-agent", "interstellar-control-api", "interstellar-control-helper", "interstellar-mdns"]
     names.extend(metadata["expected_services"])
+    names.extend(metadata["manageable_services"])
     names = list(dict.fromkeys(names))
     services = {name: service_state(name) for name in names}
     problems = [
@@ -2152,6 +2488,7 @@ def collect_stats() -> dict[str, Any]:
     filesystems = filesystem_stats()
     cpu = cpu_percentages()
     services, expected_problems = service_stats()
+    tailscale = tailscale_status()
     failed = failed_units()
 
     return {
@@ -2189,12 +2526,15 @@ def collect_stats() -> dict[str, Any]:
         "temperatures": thermal_stats(),
         "network": {
             "addresses": addresses,
+            "tailscale": tailscale,
             "interfaces": network_stats(),
             "tailscale_ipv4": tailscale_ipv4(addresses),
             "default_route": default_route(),
             "listening_tcp": listening_tcp(),
         },
         "services": services,
+        "control_plane": control_plane_status(tailscale, services),
+        "wake_on_lan": wake_on_lan_stats(),
         "service_policy": {
             **role_metadata(),
             "problems": expected_problems,
@@ -2331,7 +2671,7 @@ def prometheus(stats: dict[str, Any]) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "InterstellarAgent/3.0"
+    server_version = "InterstellarAgent/3.2"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print("%s - %s" % (self.address_string(), fmt % args), flush=True)
@@ -2445,6 +2785,810 @@ EOF
   chmod 0600 "$AGENT_ENV"
 }
 
+
+tailscale_control_version_supported() {
+  local installed metadata
+  installed="$(tailscale version 2>/dev/null | head -n 1 || true)"
+  metadata="$(tailscale version --daemon --json 2>/dev/null || true)"
+  echo "Installed Tailscale: ${installed:-unavailable}"
+  echo "Minimum for control: 1.98.9"
+  python3 - "$installed" "$metadata" <<'PYEOF'
+import json, re, sys
+try:
+    value = json.loads(sys.argv[2])
+except ValueError:
+    value = {}
+client = value.get("short") if isinstance(value, dict) else None
+daemon = value.get("daemonLong") if isinstance(value, dict) else None
+print(f"Running tailscaled: {daemon or 'unavailable'}")
+def supported(raw, daemon_version=False):
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", raw or "")
+    if not match:
+        return False
+    version = tuple(int(match.group(i)) for i in (1, 2, 3))
+    suffix = match.group(4)
+    release_hashes = bool(daemon_version and suffix and re.fullmatch(r"[tg]?[0-9a-f]{6,}(?:-[tg]?[0-9a-f]{6,})?", suffix))
+    return version > (1, 98, 9) or version == (1, 98, 9) and (not suffix or release_hashes)
+raise SystemExit(0 if client == sys.argv[1] and supported(client) and supported(daemon, True) else 1)
+PYEOF
+}
+
+write_control_helper_python() {
+  install -d -o root -g root -m 0755 "$AGENT_DIR"
+  cat >"$CONTROL_HELPER_PY" <<'PYEOF'
+#!/usr/bin/env python3
+"""Root side of the Interstellar control plane. No shell or command API."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import socket
+import sqlite3
+import struct
+import subprocess
+import threading
+import time
+from datetime import datetime, timezone
+from contextlib import contextmanager
+from pathlib import Path
+from uuid import UUID
+
+VERSION = "0.2.0"
+SOCKET_PATH = Path("/run/interstellar-control/helper.sock")
+DB_PATH = Path("/var/lib/interstellar-control/actions.db")
+POLICY_PATH = Path("/etc/interstellar/control-policy.json")
+CONTROL_UID = None
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$")
+OPERATIONS = {
+    "reboot", "shutdown", "update_refresh", "update_security", "update_all",
+    "service_start", "service_stop", "service_restart",
+    "container_start", "container_stop", "container_restart",
+    "restart_health_agent", "restart_control_agent", "restart_mdns",
+    "restart_docker", "restart_tailscaled",
+}
+LOCK = threading.Lock()
+EXECUTION_LOCK = threading.Lock()
+SLOTS = threading.BoundedSemaphore(16)
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def boot_id() -> str:
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def current_boot_time() -> datetime | None:
+    for line in Path("/proc/stat").read_text().splitlines():
+        if line.startswith("btime "):
+            return datetime.fromtimestamp(int(line.split()[1]), timezone.utc)
+    return None
+
+
+def machine_id() -> str:
+    return Path("/etc/machine-id").read_text().strip()
+
+
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def initialize() -> None:
+    DB_PATH.parent.mkdir(mode=0o2750, parents=True, exist_ok=True)
+    os.chmod(DB_PATH.parent, 0o2750)
+    with db() as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(actions)")}
+        if columns and "action" not in columns:
+            conn.execute("ALTER TABLE actions RENAME TO actions_legacy")
+        conn.execute("""CREATE TABLE IF NOT EXISTS actions (
+            action_id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, action TEXT NOT NULL,
+            target TEXT NOT NULL, identity TEXT NOT NULL, status TEXT NOT NULL,
+            timestamp TEXT NOT NULL, started_at TEXT, action_started_at TEXT,
+            dispatched_at TEXT, finished_at TEXT, reboot_duration_seconds INTEGER,
+            result TEXT, error TEXT, boot_id_before TEXT)""")
+        for column, sql_type in (("action_started_at", "TEXT"), ("dispatched_at", "TEXT"),
+                                 ("reboot_duration_seconds", "INTEGER")):
+            if column not in {row[1] for row in conn.execute("PRAGMA table_info(actions)")}:
+                conn.execute(f"ALTER TABLE actions ADD COLUMN {column} {sql_type}")
+        conn.execute("CREATE INDEX IF NOT EXISTS actions_timestamp ON actions(timestamp DESC)")
+        previous = conn.execute("""SELECT action_id, boot_id_before, action, status,
+                                         started_at, action_started_at, dispatched_at FROM actions
+                                  WHERE status IN ('running','dispatched') AND action IN ('reboot','shutdown')""").fetchall()
+        conn.execute("""UPDATE actions SET status='failed', finished_at=?, error='Interrupted by helper restart'
+                        WHERE status IN ('queued','running') AND action NOT IN ('reboot','shutdown')""", (utcnow(),))
+        conn.execute("""UPDATE actions SET status='failed', finished_at=?, error='Interrupted before dispatch'
+                        WHERE status='queued' AND action IN ('reboot','shutdown')""", (utcnow(),))
+        for row in previous:
+            if row["status"] == "running":
+                if row["action_started_at"]:
+                    conn.execute("""UPDATE actions SET status='failed', finished_at=?,
+                                  error='Interrupted before dispatch' WHERE action_id=?""",
+                                 (utcnow(), row["action_id"]))
+                    continue
+                # Upgrade v0.1 in-flight power actions without claiming success.
+                conn.execute("UPDATE actions SET status='dispatched', dispatched_at=COALESCE(dispatched_at, started_at) WHERE action_id=?",
+                             (row["action_id"],))
+            if row["action"] == "reboot" and row["boot_id_before"] != boot_id():
+                start = row["dispatched_at"] or row["action_started_at"] or row["started_at"]
+                boot_time = current_boot_time()
+                try:
+                    duration = max(0, int((boot_time - datetime.fromisoformat(start)).total_seconds())) if boot_time and start else None
+                except ValueError:
+                    duration = None
+                conn.execute("""UPDATE actions SET status='successful', finished_at=?,
+                              reboot_duration_seconds=?, result='New boot observed', error=NULL WHERE action_id=?""",
+                             (utcnow(), duration, row["action_id"]))
+        conn.execute("""DELETE FROM actions WHERE action_id NOT IN
+                        (SELECT action_id FROM actions ORDER BY timestamp DESC LIMIT 100)""")
+    os.chmod(DB_PATH, 0o640)
+
+
+def policy() -> dict:
+    data = json.loads(POLICY_PATH.read_text())
+    if not isinstance(data, dict):
+        raise ValueError("Invalid server policy")
+    for key in ("expected_services", "manageable_services", "expected_containers", "manageable_containers"):
+        if not isinstance(data.get(key), list) or any(not isinstance(x, str) or not NAME.fullmatch(x) for x in data[key]):
+            raise ValueError("Invalid server policy")
+    return data
+
+
+def validate(action: str, target: str, confirmation: str = "") -> None:
+    if action not in OPERATIONS or not isinstance(target, str):
+        raise ValueError("Unsupported action")
+    if action.startswith("service_") or action.startswith("container_"):
+        if not NAME.fullmatch(target):
+            raise ValueError("Invalid target")
+        allowed_key = "manageable_services" if action.startswith("service_") else "manageable_containers"
+        if target not in policy()[allowed_key]:
+            raise ValueError("Target is not manageable")
+        if action.startswith("service_") and target in {"ssh", "sshd", "tailscaled"}:
+            if target not in policy().get("sensitive_services_opt_in", []):
+                raise ValueError("Sensitive service requires explicit server opt-in")
+    elif target:
+        raise ValueError("Action does not accept a target")
+    if action in {"reboot", "shutdown"} and confirmation != socket.gethostname():
+        raise ValueError("Power action requires exact hostname confirmation")
+    if action == "restart_tailscaled" and "tailscaled" not in policy().get("sensitive_services_opt_in", []):
+        raise ValueError("Tailscale restart requires explicit server opt-in")
+    if action == "restart_docker" and "docker" not in policy()["manageable_services"]:
+        raise ValueError("Docker daemon is not manageable")
+
+
+def record(action_id: str, action: str, target: str, identity: str, status: str, error: str | None = None) -> None:
+    with LOCK, db() as conn:
+        conn.execute("""INSERT INTO actions(action_id,machine_id,action,target,identity,status,timestamp,error,boot_id_before)
+                        VALUES(?,?,?,?,?,?,?,?,?)""",
+                     (action_id, machine_id(), action, target, identity, status, utcnow(), error, boot_id()))
+        conn.execute("""DELETE FROM actions WHERE action_id NOT IN
+                        (SELECT action_id FROM actions ORDER BY timestamp DESC LIMIT 100)""")
+
+
+def transition(action_id: str, status: str, result: str | None = None, error: str | None = None) -> None:
+    if status not in {"running", "dispatched", "successful", "failed"}:
+        raise ValueError("Invalid action state")
+    now = utcnow()
+    with LOCK, db() as conn:
+        conn.execute("""UPDATE actions SET status=?,
+                        started_at=CASE WHEN ?='running' THEN COALESCE(started_at,?) ELSE started_at END,
+                        action_started_at=CASE WHEN ?='running' THEN COALESCE(action_started_at,?) ELSE action_started_at END,
+                        dispatched_at=CASE WHEN ?='dispatched' THEN COALESCE(dispatched_at,?) ELSE dispatched_at END,
+                        finished_at=CASE WHEN ? IN ('successful','failed') THEN ? ELSE finished_at END,
+                        result=?, error=? WHERE action_id=?""",
+                     (status, status, now, status, now, status, now, status, now, result, error, action_id))
+
+
+def docker_target(target: str) -> str:
+    proc = subprocess.run(["/usr/bin/docker", "container", "inspect", "--format", "{{.Id}}", target],
+                          capture_output=True, text=True, timeout=15, check=False)
+    if proc.returncode or not re.fullmatch(r"[0-9a-f]{64}", proc.stdout.strip()):
+        raise RuntimeError("Container is unavailable")
+    return proc.stdout.strip()
+
+
+def security_update_configuration_is_safe() -> bool:
+    """Fail closed unless unattended-upgrades is security-only and never reboots."""
+    proc = subprocess.run(["/usr/bin/apt-config", "dump"], capture_output=True, text=True, timeout=10, check=False)
+    if proc.returncode:
+        return False
+    origins = []
+    reboot = False
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        value = value.strip().strip(";\"").lower()
+        if key.startswith(("Unattended-Upgrade::Allowed-Origins::", "Unattended-Upgrade::Origins-Pattern::")):
+            origins.append(value)
+        if key == "Unattended-Upgrade::Automatic-Reboot":
+            reboot = value in {"true", "1", "yes"}
+    return bool(origins) and all("security" in origin for origin in origins) and not reboot
+
+
+def perform(action: str, target: str) -> str:
+    # Every branch constructs its own fixed argv. Target values have passed policy validation.
+    if action == "reboot":
+        proc = subprocess.run(["/usr/bin/systemctl", "reboot"], capture_output=True, timeout=10, check=False)
+    elif action == "shutdown":
+        proc = subprocess.run(["/usr/bin/systemctl", "poweroff"], capture_output=True, timeout=10, check=False)
+    elif action == "update_refresh":
+        proc = subprocess.run(["/usr/bin/apt-get", "update"], capture_output=True, timeout=900, check=False)
+    elif action == "update_security":
+        if not Path("/usr/bin/unattended-upgrade").exists():
+            raise RuntimeError("unattended-upgrades is not installed")
+        if not security_update_configuration_is_safe():
+            raise RuntimeError("Configure unattended-upgrades for security origins only and disable automatic reboot")
+        proc = subprocess.run(["/usr/bin/unattended-upgrade"], capture_output=True, timeout=3600, check=False)
+    elif action == "update_all":
+        proc = subprocess.run(["/usr/bin/apt-get", "-y", "upgrade"], capture_output=True, timeout=3600, check=False,
+                              env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "DEBIAN_FRONTEND": "noninteractive", "LC_ALL": "C"})
+    elif action == "service_start":
+        proc = subprocess.run(["/usr/bin/systemctl", "start", "--", target], capture_output=True, timeout=120, check=False)
+    elif action == "service_stop":
+        proc = subprocess.run(["/usr/bin/systemctl", "stop", "--", target], capture_output=True, timeout=120, check=False)
+    elif action == "service_restart":
+        proc = subprocess.run(["/usr/bin/systemctl", "restart", "--", target], capture_output=True, timeout=120, check=False)
+    elif action == "container_start":
+        proc = subprocess.run(["/usr/bin/docker", "container", "start", docker_target(target)], capture_output=True, timeout=120, check=False)
+    elif action == "container_stop":
+        proc = subprocess.run(["/usr/bin/docker", "container", "stop", docker_target(target)], capture_output=True, timeout=120, check=False)
+    elif action == "container_restart":
+        proc = subprocess.run(["/usr/bin/docker", "container", "restart", docker_target(target)], capture_output=True, timeout=120, check=False)
+    elif action == "restart_health_agent":
+        proc = subprocess.run(["/usr/bin/systemctl", "restart", "interstellar-agent.service"], capture_output=True, timeout=120, check=False)
+    elif action == "restart_control_agent":
+        proc = subprocess.run(["/usr/bin/systemctl", "restart", "interstellar-control-api.service"], capture_output=True, timeout=120, check=False)
+    elif action == "restart_mdns":
+        proc = subprocess.run(["/usr/bin/systemctl", "restart", "interstellar-mdns.service"], capture_output=True, timeout=120, check=False)
+    elif action == "restart_docker":
+        proc = subprocess.run(["/usr/bin/systemctl", "restart", "docker.service"], capture_output=True, timeout=180, check=False)
+    elif action == "restart_tailscaled":
+        proc = subprocess.run(["/usr/bin/systemctl", "restart", "tailscaled.service"], capture_output=True, timeout=180, check=False)
+    else:
+        raise ValueError("Unsupported action")
+    if proc.returncode:
+        raise RuntimeError(f"Action exited with status {proc.returncode}")
+    return "Action completed"
+
+
+def worker(action_id: str, action: str, target: str) -> None:
+    try:
+        with EXECUTION_LOCK:
+            transition(action_id, "running")
+            if action in {"reboot", "shutdown", "restart_control_agent"}:
+                time.sleep(1)
+                transition(action_id, "dispatched", result="Action dispatched")
+            try:
+                result = perform(action, target)
+            except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError) as err:
+                transition(action_id, "failed", error=str(err)[:180])
+            else:
+                if action not in {"reboot", "shutdown"}:
+                    transition(action_id, "successful", result=result)
+                # Reboot is reconciled against a new boot ID; shutdown stays dispatched.
+    finally:
+        SLOTS.release()
+
+
+def dispatch(request: dict, peer_uid: int) -> dict:
+    if peer_uid != CONTROL_UID:
+        return {"error": "Unauthorized socket peer"}
+    action_id, action, target, identity = (request.get(k) for k in ("action_id", "action", "target", "identity"))
+    confirmation = request.get("confirmation", "")
+    try:
+        UUID(action_id)
+        if not isinstance(identity, str) or not 1 <= len(identity) <= 200 or any(ord(c) < 32 for c in identity):
+            raise ValueError("Invalid identity")
+        validate(action, target, confirmation)
+    except (TypeError, ValueError) as err:
+        if isinstance(action_id, str) and isinstance(action, str) and isinstance(target, str) and isinstance(identity, str):
+            try:
+                UUID(action_id)
+                record(action_id, action[:80], target[:128], identity[:200], "failed", str(err))
+            except (ValueError, sqlite3.IntegrityError):
+                pass
+        return {"error": str(err)}
+    if not SLOTS.acquire(blocking=False):
+        record(action_id, action, target, identity, "failed", "Action queue is full")
+        return {"error": "Action queue is full"}
+    try:
+        record(action_id, action, target, identity, "queued")
+    except sqlite3.IntegrityError:
+        SLOTS.release()
+        return {"error": "Duplicate action ID"}
+    except sqlite3.Error:
+        SLOTS.release()
+        return {"error": "Audit unavailable"}
+    threading.Thread(target=worker, args=(action_id, action, target), daemon=True).start()
+    return {"action_id": action_id, "status": "queued"}
+
+
+def snapshot() -> dict:
+    result = {"docker": {"installed": Path("/usr/bin/docker").exists(), "daemon_running": False,
+                         "containers": [], "images": None, "disk_usage": []},
+              "toolbox_version": None, "boot_time_utc": None}
+    for line in Path("/proc/stat").read_text().splitlines():
+        if line.startswith("btime "):
+            result["boot_time_utc"] = datetime.fromtimestamp(int(line.split()[1]), timezone.utc).isoformat()
+            break
+    toolbox = Path("/usr/local/sbin/interstellar-toolbox")
+    if toolbox.exists():
+        match = re.search(r'^TOOLBOX_VERSION="([0-9.]+)"$', toolbox.read_text(errors="replace"), re.M)
+        if match:
+            result["toolbox_version"] = match.group(1)
+    if not result["docker"]["installed"]:
+        return result
+    try:
+        info = subprocess.run(["/usr/bin/docker", "info", "--format", "{{json .}}"],
+                              capture_output=True, text=True, timeout=10, check=False)
+        if info.returncode:
+            return result
+        parsed = json.loads(info.stdout)
+        result["docker"].update({"daemon_running": True, "version": parsed.get("ServerVersion"),
+                                 "images": parsed.get("Images"), "total": parsed.get("Containers"),
+                                 "running": parsed.get("ContainersRunning"), "stopped": parsed.get("ContainersStopped")})
+        containers = subprocess.run(["/usr/bin/docker", "ps", "-a", "--format", "{{json .}}"],
+                                    capture_output=True, text=True, timeout=10, check=False)
+        if containers.returncode == 0:
+            for line in containers.stdout.splitlines()[:100]:
+                item = json.loads(line)
+                identifier = item.get("ID", "")
+                if not re.fullmatch(r"[0-9a-f]{12,64}", identifier):
+                    continue
+                detail = subprocess.run(["/usr/bin/docker", "container", "inspect", "--format", "{{json .}}", identifier],
+                                        capture_output=True, text=True, timeout=10, check=False)
+                if detail.returncode:
+                    continue
+                data = json.loads(detail.stdout)
+                state = data.get("State") or {}
+                labels = (data.get("Config") or {}).get("Labels") or {}
+                result["docker"]["containers"].append({
+                    "id": data.get("Id"), "name": str(data.get("Name", "")).lstrip("/"),
+                    "image": (data.get("Config") or {}).get("Image"),
+                    "state": state.get("Status"), "health": (state.get("Health") or {}).get("Status"),
+                    "started_at": state.get("StartedAt"), "restart_count": data.get("RestartCount"),
+                    "ports": item.get("Ports"), "project": labels.get("com.docker.compose.project"),
+                })
+        usage = subprocess.run(["/usr/bin/docker", "system", "df", "--format", "{{json .}}"],
+                               capture_output=True, text=True, timeout=10, check=False)
+        if usage.returncode == 0:
+            result["docker"]["disk_usage"] = [json.loads(line) for line in usage.stdout.splitlines()[:10]]
+        compose = subprocess.run(["/usr/bin/docker", "compose", "version", "--short"],
+                                 capture_output=True, text=True, timeout=5, check=False)
+        if compose.returncode == 0:
+            result["docker"]["compose_version"] = compose.stdout.strip()[:60]
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return result
+
+
+def main() -> None:
+    global CONTROL_UID
+    import pwd
+    import grp
+    CONTROL_UID = pwd.getpwnam("interstellar-control").pw_uid
+    gid = grp.getgrnam("interstellar-control").gr_gid
+    initialize()
+    os.chown(DB_PATH, 0, gid)
+    SOCKET_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    if SOCKET_PATH.exists():
+        SOCKET_PATH.unlink()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(SOCKET_PATH))
+    os.chown(SOCKET_PATH, 0, gid)
+    os.chmod(SOCKET_PATH, 0o660)
+    server.listen(16)
+    while True:
+        conn, _ = server.accept()
+        with conn:
+            conn.settimeout(5)
+            _, uid, _ = struct.unpack("3i", conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            try:
+                raw = conn.recv(4097)
+                if len(raw) > 4096:
+                    raise ValueError("Request too large")
+                request = json.loads(raw)
+                if not isinstance(request, dict):
+                    raise ValueError("Invalid request")
+                if request.get("query") == "state" and uid == CONTROL_UID:
+                    response = snapshot()
+                else:
+                    response = dispatch(request, uid)
+            except (ValueError, OSError, sqlite3.Error) as err:
+                response = {"error": str(err)}
+            conn.sendall(json.dumps(response).encode())
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+  chown root:root "$CONTROL_HELPER_PY"
+  chmod 0755 "$CONTROL_HELPER_PY"
+}
+
+write_control_api_python() {
+  cat >"$CONTROL_API_PY" <<'PYEOF'
+#!/usr/bin/env python3
+"""Unprivileged, loopback-only HTTP facade for allowlisted control actions."""
+from __future__ import annotations
+
+import json
+from contextlib import closing
+import os
+import re
+import socket
+import sqlite3
+import subprocess
+from http.server import BaseHTTPRequestHandler
+from socketserver import ThreadingUnixStreamServer
+from pathlib import Path
+from urllib.parse import urlsplit
+from uuid import uuid4
+
+VERSION = "0.2.0"
+TAILSCALE_CONTROL_MINIMUM_VERSION = "1.98.9"
+CAPABILITY = "interstellarnetwork.nl/cap/server-control"
+API_SOCKET = Path("/run/interstellar-control-api/api.sock")
+SOCKET_PATH = "/run/interstellar-control/helper.sock"
+DB_PATH = "/var/lib/interstellar-control/actions.db"
+POLICY_PATH = Path("/etc/interstellar/control-policy.json")
+NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$")
+ACTION_PATHS = {
+    "/actions/reboot": ("reboot", None),
+    "/actions/shutdown": ("shutdown", None),
+    "/actions/update/refresh": ("update_refresh", None),
+    "/actions/interstellar/restart-health-agent": ("restart_health_agent", None),
+    "/actions/interstellar/restart-control-agent": ("restart_control_agent", None),
+    "/actions/interstellar/restart-mdns": ("restart_mdns", None),
+    "/actions/docker/restart-daemon": ("restart_docker", None),
+    "/actions/tailscale/restart": ("restart_tailscaled", None),
+}
+
+
+def version_supported(raw: str, daemon: bool = False) -> bool:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", raw)
+    if not match:
+        return False
+    version = tuple(int(match.group(i)) for i in (1, 2, 3))
+    suffix = match.group(4)
+    # Tailscale daemonLong has release commit hashes after the numeric version.
+    release_hashes = bool(daemon and suffix and re.fullmatch(r"[tg]?[0-9a-f]{6,}(?:-[tg]?[0-9a-f]{6,})?", suffix))
+    return version > (1, 98, 9) or version == (1, 98, 9) and (not suffix or release_hashes)
+
+
+def tailscale_control_status() -> dict:
+    """Fail closed unless both the CLI and running Serve daemon are patched."""
+    try:
+        proc = subprocess.run(["/usr/bin/tailscale", "version", "--daemon", "--json"], capture_output=True,
+                              text=True, timeout=5, check=False)
+        payload = json.loads(proc.stdout) if proc.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        payload = {}
+    client = payload.get("short") if isinstance(payload, dict) else None
+    daemon = payload.get("daemonLong") if isinstance(payload, dict) else None
+    client = client if isinstance(client, str) else None
+    daemon = daemon if isinstance(daemon, str) else None
+    available = bool(client and daemon and version_supported(client) and version_supported(daemon, daemon=True))
+    return {"control_available": available,
+            "control_unavailable_reason": None if available else "Tailscale CLI and running daemon must both be 1.98.9 or newer",
+            "tailscale_version": client,
+            "tailscale_daemon_version": daemon,
+            "tailscale_control_minimum_version": TAILSCALE_CONTROL_MINIMUM_VERSION}
+for kind in ("service", "container"):
+    for operation in ("start", "stop", "restart"):
+        segment = "docker" if kind == "container" else kind
+        ACTION_PATHS[f"/actions/{segment}/{operation}"] = (f"{kind}_{operation}", kind)
+
+
+def identity(headers) -> str | None:
+    try:
+        caps = json.loads(headers.get("Tailscale-App-Capabilities", ""))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(caps, dict) or not isinstance(caps.get(CAPABILITY), list) or not caps[CAPABILITY]:
+        return None
+    # Tailscale omits user identity for tagged devices. The grant still authenticates the node.
+    value = headers.get("Tailscale-User-Login") or headers.get("Tailscale-User-Name") or "tailscale-tagged-node"
+    if len(value) > 200 or any(ord(c) < 32 for c in value):
+        return None
+    return value
+
+
+def audit(limit: int = 50, action_id: str | None = None) -> list[dict]:
+    try:
+        with closing(sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)) as conn:
+            conn.row_factory = sqlite3.Row
+            if action_id:
+                rows = conn.execute("SELECT * FROM actions WHERE action_id=?", (action_id,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM actions ORDER BY timestamp DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(row) for row in rows]
+    except sqlite3.Error:
+        return []
+
+
+def current_policy() -> dict:
+    data = json.loads(POLICY_PATH.read_text())
+    return {key: data.get(key, []) for key in (
+        "expected_services", "manageable_services", "expected_containers", "manageable_containers",
+        "sensitive_services_opt_in")}
+
+
+def helper_state() -> dict:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(15)
+        conn.connect(SOCKET_PATH)
+        conn.sendall(b'{"query":"state"}')
+        return json.loads(conn.recv(262144))
+
+
+def send_action(action: str, target: str, principal: str, confirmation: str = "") -> dict:
+    request = {"action_id": str(uuid4()), "action": action, "target": target,
+               "identity": principal, "confirmation": confirmation}
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(5)
+        conn.connect(SOCKET_PATH)
+        conn.sendall(json.dumps(request).encode())
+        result = json.loads(conn.recv(4096))
+    return result
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "InterstellarControl/0.1"
+
+    def log_message(self, fmt: str, *args) -> None:
+        # Action audit is structured; avoid request lines that may contain secrets.
+        pass
+
+    def reply(self, status: int, data: dict) -> None:
+        body = json.dumps(data, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        path = urlsplit(self.path).path
+        if path != "/" and identity(self.headers) is None:
+            self.reply(403, {"error": "Tailscale control capability required"})
+            return
+        if path == "/":
+            self.reply(200, {"name": "Interstellar control", "version": VERSION, "authenticated": identity(self.headers) is not None})
+        elif path == "/state":
+            try:
+                state = {"version": VERSION, "policy": current_policy(), **helper_state()}
+                state.update(tailscale_control_status())
+                previous = next((a for a in audit(100) if a.get("action") == "reboot"), None)
+                state["last_reboot_action"] = previous
+                if previous and previous.get("reboot_duration_seconds") is not None:
+                    state["last_reboot_duration_seconds"] = previous["reboot_duration_seconds"]
+                self.reply(200, state)
+            except (OSError, ValueError):
+                self.reply(503, {"error": "Control state unavailable"})
+        elif path == "/actions":
+            self.reply(200, {"actions": audit()})
+        elif re.fullmatch(r"/actions/[0-9a-fA-F-]{36}", path):
+            rows = audit(action_id=path.split("/")[-1])
+            self.reply(200 if rows else 404, rows[0] if rows else {"error": "Action not found"})
+        else:
+            self.reply(404, {"error": "Not found"})
+
+    def do_POST(self) -> None:
+        principal = identity(self.headers)
+        if principal is None:
+            self.reply(403, {"error": "Tailscale control capability required"})
+            return
+        version_status = tailscale_control_status()
+        if not version_status["control_available"]:
+            self.reply(503, {"error": version_status["control_unavailable_reason"], **version_status})
+            return
+        path = urlsplit(self.path).path
+        length = self.headers.get("Content-Length", "0")
+        if not length.isdecimal() or int(length) > 1024:
+            self.reply(413, {"error": "Invalid body length"})
+            return
+        try:
+            body = json.loads(self.rfile.read(int(length))) if int(length) else {}
+        except (ValueError, UnicodeDecodeError):
+            self.reply(400, {"error": "Invalid JSON"})
+            return
+        if not isinstance(body, dict):
+            self.reply(400, {"error": "Expected object"})
+            return
+        if path == "/actions/update/install":
+            if set(body) != {"type"} or body["type"] not in ("security", "all"):
+                self.reply(400, {"error": "Update type must be security or all"})
+                return
+            action, target = "update_" + body["type"], ""
+        else:
+            route = ACTION_PATHS.get(path)
+            if route is None:
+                self.reply(404, {"error": "Unknown action"})
+                return
+            action, kind = route
+            key = "service" if kind == "service" else "container" if kind == "container" else None
+            if key:
+                if set(body) != {key} or not isinstance(body[key], str) or not NAME.fullmatch(body[key]):
+                    self.reply(400, {"error": "Invalid target"})
+                    return
+                target = body[key]
+            elif action in {"reboot", "shutdown"}:
+                if set(body) != {"confirm_hostname"} or not isinstance(body["confirm_hostname"], str):
+                    self.reply(400, {"error": "Exact hostname confirmation required"})
+                    return
+                target = ""
+            elif body:
+                self.reply(400, {"error": "Action does not accept arguments"})
+                return
+            else:
+                target = ""
+        try:
+            result = send_action(action, target, principal, body.get("confirm_hostname", ""))
+        except (OSError, ValueError, socket.timeout):
+            self.reply(503, {"error": "Control helper unavailable"})
+            return
+        self.reply(202 if "action_id" in result else 403, result)
+
+
+if __name__ == "__main__":
+    if API_SOCKET.exists():
+        API_SOCKET.unlink()
+    server = ThreadingUnixStreamServer(str(API_SOCKET), Handler)
+    os.chmod(API_SOCKET, 0o600)
+    server.serve_forever()
+PYEOF
+  chown root:root "$CONTROL_API_PY"
+  chmod 0755 "$CONTROL_API_PY"
+}
+
+write_control_helper_unit() {
+  cat >"$CONTROL_HELPER_UNIT" <<'EOF'
+[Unit]
+Description=Interstellar Network Privileged Control Helper
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+RuntimeDirectory=interstellar-control
+RuntimeDirectoryMode=0755
+ExecStart=/usr/bin/python3 /usr/local/lib/interstellar/control-helper.py
+Restart=on-failure
+RestartSec=3
+PrivateTmp=yes
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chown root:root "$CONTROL_HELPER_UNIT"
+  chmod 0644 "$CONTROL_HELPER_UNIT"
+}
+
+write_control_api_unit() {
+  cat >"$CONTROL_API_UNIT" <<'EOF'
+[Unit]
+Description=Interstellar Network Unprivileged Control API
+After=network-online.target interstellar-control-helper.service
+Requires=interstellar-control-helper.service
+
+[Service]
+Type=simple
+User=interstellar-control
+Group=interstellar-control
+RuntimeDirectory=interstellar-control-api
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/python3 /usr/local/lib/interstellar/control-api.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/run/interstellar-control-api
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chown root:root "$CONTROL_API_UNIT"
+  chmod 0644 "$CONTROL_API_UNIT"
+}
+
+write_control_policy() {
+  local expected="$1" manageable="$2" expected_containers="$3" manageable_containers="$4"
+  install -d -o root -g root -m 0755 /etc/interstellar
+  python3 - "$CONTROL_POLICY" "$expected" "$manageable" "$expected_containers" "$manageable_containers" <<'PYEOF'
+import json, re, sys
+from pathlib import Path
+name = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,127}$")
+keys = ("expected_services", "manageable_services", "expected_containers", "manageable_containers")
+policy = {}
+for key, raw in zip(keys, sys.argv[2:]):
+    values = list(dict.fromkeys(x.strip() for x in raw.split(",") if x.strip()))
+    if any(not name.fullmatch(x) for x in values):
+        raise SystemExit(f"Invalid {key} target")
+    policy[key] = values
+policy["sensitive_services_opt_in"] = []
+Path(sys.argv[1]).write_text(json.dumps(policy, indent=2) + "\n")
+PYEOF
+  chown root:root "$CONTROL_POLICY"
+  chmod 0644 "$CONTROL_POLICY"
+}
+
+install_control_plane() {
+  if ! tailscale_control_version_supported; then
+    warn "Control installation requires Tailscale 1.98.9 or newer. Health monitoring remains available."
+    return 1
+  fi
+  install_pkg python3
+  if ! getent group interstellar-control >/dev/null; then
+    groupadd --system interstellar-control
+  fi
+  if ! getent passwd interstellar-control >/dev/null; then
+    useradd --system --gid interstellar-control --shell /usr/sbin/nologin --home-dir /nonexistent interstellar-control
+  else
+    usermod --gid interstellar-control interstellar-control
+  fi
+  install -d -o root -g interstellar-control -m 2750 /var/lib/interstellar-control
+  local expected manageable expected_containers manageable_containers
+  expected="$(agent_env_value INTERSTELLAR_EXPECTED_SERVICES 2>/dev/null || echo ssh,tailscaled)"
+  manageable="$(ui_input "Manageable services" "Comma-separated systemd units HA may control. SSH and Tailscale require extra server-side opt-in." "docker")" || return
+  expected_containers="$(ui_input "Expected containers" "Comma-separated Docker container names that should run:" "")" || return
+  manageable_containers="$(ui_input "Manageable containers" "Comma-separated Docker container names HA may control:" "")" || return
+  write_control_policy "$expected" "$manageable" "$expected_containers" "$manageable_containers"
+  write_control_helper_python
+  write_control_api_python
+  write_control_helper_unit
+  write_control_api_unit
+  systemctl daemon-reload
+  systemctl enable interstellar-control-helper interstellar-control-api
+  systemctl restart interstellar-control-helper
+  systemctl restart interstellar-control-api
+  fix "Interstellar control plane v0.2.0 installed."
+  info "Configure a tailnet Grant for interstellarnetwork.nl/cap/server-control."
+  info "Then run: tailscale serve --bg --https=8443 --accept-app-caps=interstellarnetwork.nl/cap/server-control unix:/run/interstellar-control-api/api.sock"
+  info "Add https://YOUR-MAGICDNS-NAME:8443 as the control URL in Home Assistant."
+}
+
+upgrade_control_plane_noninteractive() {
+  [[ -f "$CONTROL_POLICY" && -f "$CONTROL_API_UNIT" ]] || return 0
+  if ! tailscale_control_version_supported; then
+    warn "Control upgrade paused until Tailscale is 1.98.9 or newer."
+    return 1
+  fi
+  write_control_helper_python
+  write_control_api_python
+  write_control_helper_unit
+  write_control_api_unit
+  systemctl daemon-reload
+  systemctl restart interstellar-control-helper
+  systemctl restart interstellar-control-api
+}
+
 install_health_agent() {
   install_pkg python3
   local port roles expected
@@ -2459,9 +3603,14 @@ install_health_agent() {
   write_agent_unit
   write_agent_env "$port" "$roles" "$expected"
   systemctl daemon-reload
-  systemctl enable --now interstellar-agent
+  systemctl enable interstellar-agent
+  systemctl restart interstellar-agent
+  if [[ -f "$MDNS_ENV" ]]; then
+    sed -i 's/^INTERSTELLAR_AGENT_VERSION=.*/INTERSTELLAR_AGENT_VERSION=3.2.0/' "$MDNS_ENV"
+    systemctl restart interstellar-mdns 2>/dev/null || true
+  fi
 
-  fix "Read-only health agent v3 installed/upgraded."
+  fix "Read-only health agent v3.2 installed/upgraded."
   info "Backend: http://127.0.0.1:${port}"
   info "Roles: ${roles}"
   info "Expected services: ${expected}"
@@ -2485,6 +3634,7 @@ agent_show_status() {
   echo
   echo "Tailscale Serve"
   tailscale serve status 2>/dev/null | sed 's/^/  /' || echo "  Not configured"
+  tailscale_control_version_supported || true
   echo
   echo
   echo "Server policy"
@@ -2526,7 +3676,7 @@ agent_configure_roles_services() {
 
   role_on() { [[ ",${current_roles}," == *",$1,"* ]] && echo ON || echo OFF; }
   set +e
-  result="$(ui_checklist "Server roles" "Choose one or more roles. Roles are metadata; docker-host also implies Docker should be running." \
+  result="$(ui_checklist "Server roles" "Choose one or more roles. Roles are presentation metadata; add Docker explicitly to expected services if needed." \
     "general" "General-purpose server" "$(role_on general)" \
     "development" "Development workstation / build host" "$(role_on development)" \
     "docker-host" "Docker/container host" "$(role_on docker-host)" \
@@ -2542,11 +3692,21 @@ agent_configure_roles_services() {
   roles="$(printf '%s' "$result" | tr -d '"' | tr ' ' ',' | sed 's/^,*//;s/,*$//')"
   [[ -n "$roles" ]] || roles="general"
 
-  expected="$(ui_input "Expected services" "Comma-separated systemd service names.\nIf an expected service is not active, Home Assistant will raise a problem.\n\nRole docker-host automatically also expects docker." "$current_expected")" || return
+  expected="$(ui_input "Expected services" "Comma-separated systemd service names.\nIf an expected service is not active, Home Assistant will raise a problem.\n\nRoles do not add expected services automatically." "$current_expected")" || return
   expected="$(printf '%s' "$expected" | tr -d ' ' | sed 's/^,*//;s/,*$//')"
   [[ -n "$expected" ]] || expected="ssh,tailscaled"
 
   write_agent_env "$port" "$roles" "$expected"
+  if [[ -f "$CONTROL_POLICY" ]]; then
+    python3 - "$CONTROL_POLICY" "$expected" <<'PYEOF'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+policy = json.loads(path.read_text())
+policy["expected_services"] = [x for x in sys.argv[2].split(",") if x]
+path.write_text(json.dumps(policy, indent=2) + "\n")
+PYEOF
+  fi
   systemctl restart interstellar-agent
   ui_msg "Server policy" "Roles: $roles\nExpected services: $expected\n\nAgent restarted."
 }
@@ -2655,11 +3815,12 @@ INTERSTELLAR_MACHINE_ID=${machine}
 INTERSTELLAR_URL=https://${ts_dns}
 INTERSTELLAR_LAN_IP=${lan_ip}
 INTERSTELLAR_ROLES=${roles}
-INTERSTELLAR_AGENT_VERSION=3.0.0
+INTERSTELLAR_AGENT_VERSION=3.2.0
 EOF
   chmod 0644 "$MDNS_ENV"
   systemctl daemon-reload
-  systemctl enable --now interstellar-mdns
+  systemctl enable interstellar-mdns
+  systemctl restart interstellar-mdns
   fix "Home Assistant auto-discovery enabled."
   info "mDNS: _interstellar._tcp.local."
   info "Advertised URL: https://${ts_dns}"
@@ -2691,20 +3852,7 @@ agent_disable_tailscale_serve() {
 }
 
 agent_security_model() {
-  ui_msg "Health/control security" "HEALTH PLANE
-• read-only HTTP backend
-• listens on 127.0.0.1 only
-• Tailscale Serve provides encrypted tailnet access
-• Tailscale ACL/Grants decide who can connect
-• no reusable bearer token
-
-CONTROL PLANE
-Reboot/update/firewall actions are NOT exposed over this health API.
-
-Remote privileged actions should use:
-SSH + Tailscale + sudo + interstellar
-
-A future web control plane should be separate, use Tailscale identity/app capabilities, a local root helper over a Unix socket, and audit every action."
+  ui_msg "Health/control security" "HEALTH: unprivileged GET-only agent on 127.0.0.1:9127.\n\nCONTROL: separate private Unix HTTP socket with Tailscale Serve app capability, root helper, server policy, and audit. Local root and trusted local processes remain inside the host trust boundary."
 }
 
 agent_local_url() {
@@ -2736,51 +3884,57 @@ agent_toggle_public_health() {
 }
 
 agent_uninstall() {
-  ui_yesno "Uninstall health agent" "Remove the local Interstellar health agent?" || return
+  ui_yesno "Uninstall agents" "Remove the local Interstellar agents?" || return
   systemctl disable --now interstellar-agent 2>/dev/null || true
   systemctl disable --now interstellar-mdns 2>/dev/null || true
+  systemctl disable --now interstellar-control-api 2>/dev/null || true
+  systemctl disable --now interstellar-control-helper 2>/dev/null || true
   rm -f "$AGENT_UNIT" "$AGENT_ENV" "$AGENT_PY" "$MDNS_UNIT" "$MDNS_ENV" "$MDNS_PY"
+  rm -f "$CONTROL_API_UNIT" "$CONTROL_API_PY" "$CONTROL_HELPER_UNIT" "$CONTROL_HELPER_PY" "$CONTROL_POLICY"
+  rm -f /var/lib/interstellar-control/actions.db
   rmdir "$AGENT_DIR" 2>/dev/null || true
   systemctl daemon-reload
-  fix "Health agent uninstalled."
+  fix "Agents uninstalled."
   info "Tailscale Serve is left unchanged; disable it separately if desired."
 }
 
 agent_menu() {
   while true; do
     local choice
-    choice="$(ui_menu "Health API agent" \
-"Read-only server telemetry, policy and Home Assistant discovery." \
+    choice="$(ui_menu "Interstellar API / Agent" \
+"Telemetry, Control plane, policy and Home Assistant discovery." \
       "1" "Show status, policy, ports & Serve URL" \
-      "2" "Install / repair / upgrade agent" \
-      "3" "Change local API port" \
-      "4" "Configure server roles & expected services" \
-      "5" "Enable Tailscale Serve" \
-      "6" "Disable Tailscale Serve" \
-      "7" "Enable Home Assistant auto-discovery" \
-      "8" "Disable Home Assistant auto-discovery" \
-      "9" "Test /health" \
-      "10" "Test /stats" \
-      "11" "Test /metrics" \
-      "12" "Explain security model" \
-      "13" "Restart agent" \
-      "14" "Uninstall agent" \
+      "2" "Install / repair / upgrade Health API" \
+      "3" "Install / repair / upgrade Control API" \
+      "4" "Change Health API port" \
+      "5" "Configure server roles & expected services" \
+      "6" "Enable Tailscale Serve" \
+      "7" "Disable Tailscale Serve" \
+      "8" "Enable Home Assistant auto-discovery" \
+      "9" "Disable Home Assistant auto-discovery" \
+      "10" "Test /health" \
+      "11" "Test /stats" \
+      "12" "Test /metrics" \
+      "13" "Explain security model" \
+      "14" "Restart agents" \
+      "15" "Uninstall agents" \
       "0" "Back")" || return
     case "$choice" in
       1) clear; agent_show_status; pause ;;
       2) clear; install_health_agent; pause ;;
-      3) agent_configure_binding ;;
-      4) agent_configure_roles_services ;;
-      5) clear; agent_enable_tailscale_serve; pause ;;
-      6) clear; agent_disable_tailscale_serve; pause ;;
-      7) clear; agent_enable_discovery; pause ;;
-      8) clear; agent_disable_discovery; pause ;;
-      9) clear; agent_test_health; pause ;;
-      10) clear; agent_test_stats; pause ;;
-      11) clear; agent_test_metrics; pause ;;
-      12) agent_security_model ;;
-      13) systemctl restart interstellar-agent; ui_msg "Health API" "Agent restarted." ;;
-      14) clear; agent_uninstall; pause ;;
+      3) clear; if ! tailscale_control_version_supported; then warn "Control requires Tailscale 1.98.9+ for both CLI and daemon."; pause; continue; fi; install_control_plane; pause ;;
+      4) agent_configure_binding ;;
+      5) agent_configure_roles_services ;;
+      6) clear; agent_enable_tailscale_serve; pause ;;
+      7) clear; agent_disable_tailscale_serve; pause ;;
+      8) clear; agent_enable_discovery; pause ;;
+      9) clear; agent_disable_discovery; pause ;;
+      10) clear; agent_test_health; pause ;;
+      11) clear; agent_test_stats; pause ;;
+      12) clear; agent_test_metrics; pause ;;
+      13) agent_security_model ;;
+      14) systemctl restart interstellar-agent interstellar-control-api interstellar-control-helper; ui_msg "API" "Agents restarted." ;;
+      15) clear; agent_uninstall; pause ;;
       0) return ;;
     esac
   done
@@ -2961,7 +4115,8 @@ EOF
 
   fix "Interstellar Network Toolbox updated to ${latest}."
 
-  if systemctl list-unit-files interstellar-agent.service >/dev/null 2>&1; then
+  if systemctl list-unit-files interstellar-agent.service >/dev/null 2>&1 ||
+     systemctl list-unit-files interstellar-control-api.service >/dev/null 2>&1; then
     echo
     info "Refreshing the embedded Interstellar health agent..."
     # Re-run using the new script so the agent version bundled in that
@@ -3110,7 +4265,7 @@ main_menu() {
       "7" "Install tools" \
       "8" "Docker & containers" \
       "9" "System maintenance" \
-      "10" "Health API agent" \
+      "10" "Interstellar API / Agent" \
       "11" "Toolbox & releases" \
       "0" "Exit")" || exit 0
     case "$choice" in
@@ -3132,7 +4287,8 @@ main_menu() {
 
 
 if [[ "${1:-}" == "--upgrade-agent-noninteractive" ]]; then
-  install_health_agent
+  if [[ -f "$AGENT_UNIT" ]]; then install_health_agent; fi
+  upgrade_control_plane_noninteractive
   exit 0
 fi
 

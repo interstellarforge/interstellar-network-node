@@ -74,7 +74,20 @@ print(f"Toolbox TOOLBOX_VERSION -> {version}")
 PY
 
 info "Validating toolbox"
+python3 scripts/embed-control.py
 bash -n "$TOOLBOX"
+python3 - "$TOOLBOX" <<'PYCODE'
+from pathlib import Path
+import sys
+box = Path(sys.argv[1]).read_text()
+for function, source in (("write_control_helper_python", "control/control_helper.py"),
+                         ("write_control_api_python", "control/control_api.py")):
+    start = box.index(function + "() {")
+    start = box.index("<<'PYEOF'\n", start) + len("<<'PYEOF'\n")
+    end = box.index("\nPYEOF", start)
+    if box[start:end] != Path(source).read_text().rstrip("\n"):
+        raise SystemExit(f"Embedded {function} differs from {source}; regenerate the toolbox")
+PYCODE
 git diff --check
 
 if [[ -n "$(git status --porcelain)" ]]; then
