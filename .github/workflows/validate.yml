@@ -1,0 +1,22 @@
+name: Validate
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate shell scripts
+        run: |
+          bash -n toolbox/interstellar-network-toolbox.sh
+          bash -n install.sh
+          bash -n scripts/release.sh
+          bash -n scripts/configure-repository.sh
