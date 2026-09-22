@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Supports Debian and Ubuntu.
 # Start without arguments for the interactive menu.
 
-TOOLBOX_VERSION="4.3.2"
+TOOLBOX_VERSION="4.3.3"
 BACKUP_DIR="/var/backups/interstellar-toolbox"
 SSH_DROPIN="/etc/ssh/sshd_config.d/99-interstellar-hardening.conf"
 MANAGER_INSTALL_PATH="/usr/local/sbin/interstellar-toolbox"
