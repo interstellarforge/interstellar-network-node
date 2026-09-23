@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 TAILSCALE_CONTROL_MINIMUM_VERSION = "1.98.9"
 CAPABILITY = "interstellarnetwork.nl/cap/server-control"
 API_SOCKET = Path("/run/interstellar-control-api/api.sock")
@@ -124,7 +124,13 @@ def send_action(action: str, target: str, principal: str, confirmation: str = ""
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "InterstellarControl/0.1"
+    server_version = f"InterstellarControl/{VERSION}"
+    sys_version = ""
+
+    def version_string(self) -> str:
+        # The default appends the Python runtime version, and joining with an
+        # empty sys_version would leave a trailing space in the header.
+        return self.server_version
 
     def log_message(self, fmt: str, *args) -> None:
         # Action audit is structured; avoid request lines that may contain secrets.

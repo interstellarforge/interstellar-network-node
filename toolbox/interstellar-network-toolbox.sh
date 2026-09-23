@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Supports Debian and Ubuntu.
 # Start without arguments for the interactive menu.
 
-TOOLBOX_VERSION="4.5.0"
+TOOLBOX_VERSION="4.5.1"
 BACKUP_DIR="/var/backups/interstellar-toolbox"
 SSH_DROPIN="/etc/ssh/sshd_config.d/99-interstellar-hardening.conf"
 MANAGER_INSTALL_PATH="/usr/local/sbin/interstellar-toolbox"
@@ -1730,7 +1730,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 BIND = "127.0.0.1"
 PORT = int(os.environ.get("INTERSTELLAR_PORT", "9127"))
 ROLES = [x.strip() for x in os.environ.get("INTERSTELLAR_ROLES", "general").split(",") if x.strip()]
@@ -1850,11 +1850,24 @@ SERVICE_PROCESSES: dict[str, set[str]] = {
     "nginx": {"nginx"},
 }
 
+# systemd RuntimeDirectory per unit, used when `systemctl show` is unavailable.
+SERVICE_RUNTIME_PATHS: dict[str, str] = {
+    "interstellar-control-api": "/run/interstellar-control-api",
+    "interstellar-control-helper": "/run/interstellar-control",
+}
+CONTROL_POLICY_PATH = "/etc/interstellar/control-policy.json"
+
 
 def service_state(name: str) -> str:
     output = run([SYSTEMCTL, "show", "-p", "ActiveState", "--value", name], timeout=2.0)
     if output in {"active", "inactive", "failed", "activating", "deactivating", "reloading"}:
         return output
+    runtime = SERVICE_RUNTIME_PATHS.get(name)
+    if runtime:
+        # These units run as `python3`, so /proc comm matching cannot see them.
+        # systemd drops RuntimeDirectory when the unit stops, and the directory
+        # entry is stat-able by the unprivileged agent without entering it.
+        return "active" if os.path.isdir(runtime) else "inactive"
     processes = SERVICE_PROCESSES.get(name, {name})
     return "active" if process_running(processes) else "inactive"
 
@@ -2364,12 +2377,33 @@ def control_plane_status(tailscale: dict[str, Any], services: dict[str, str]) ->
         release_hashes = bool(daemon_version and suffix and re.fullmatch(r"[tg]?[0-9a-f]{6,}(?:-[tg]?[0-9a-f]{6,})?", suffix))
         return version > (1, 98, 9) or version == (1, 98, 9) and (not suffix or release_hashes)
     valid = supported(raw) and supported(daemon, True)
+    installed = os.path.exists(CONTROL_POLICY_PATH)
+    api_active = services.get("interstellar-control-api") == "active"
+    helper_active = services.get("interstellar-control-helper") == "active"
+    # These are three independent facts. The health agent can observe local
+    # service state, can infer whether a Serve listener ought to exist, and can
+    # never know whether Home Assistant holds the tailnet app capability. Only
+    # the control API itself can answer that, so nothing here may be reported
+    # as "control is available to Home Assistant".
     reason = None
-    if not valid:
+    if not installed:
+        reason = "Control plane is not installed"
+    elif not valid:
         reason = "Tailscale CLI and running daemon must both be 1.98.9 or newer"
-    elif services.get("interstellar-control-api") != "active":
-        reason = "Control API is not active"
-    return {"control_available": reason is None, "control_unavailable_reason": reason,
+    elif not api_active:
+        reason = "Control API service is not active"
+    elif not helper_active:
+        reason = "Control helper service is not active"
+    return {"installed": installed,
+            "api_service_active": api_active,
+            "helper_service_active": helper_active,
+            "serve_expected": installed and valid,
+            "tailscale_version_supported": valid,
+            "control_service_ready": reason is None,
+            "control_service_unavailable_reason": reason,
+            # Retained for older Home Assistant integrations. These describe local
+            # service readiness only, never remote authorization.
+            "control_available": reason is None, "control_unavailable_reason": reason,
             "tailscale_version": raw or None, "tailscale_daemon_version": daemon or None,
             "tailscale_control_minimum_version": "1.98.9"}
 
@@ -2813,6 +2847,341 @@ raise SystemExit(0 if client == sys.argv[1] and supported(client) and supported(
 PYEOF
 }
 
+# ---------------- Tailscale Serve topology ----------------
+#
+# Health:  https://<magicdns>/      -> http://127.0.0.1:<health port>
+# Control: https://<magicdns>:8443/ -> unix:/run/interstellar-control-api/api.sock
+#
+# The control handler must also accept the app capability. Without it Serve
+# strips the capability header and the control API answers every request with
+# HTTP 403, even though both services are running.
+
+CONTROL_SERVE_PORT="8443"
+CONTROL_CAPABILITY="interstellarnetwork.nl/cap/server-control"
+CONTROL_API_SOCKET="/run/interstellar-control-api/api.sock"
+CONTROL_SERVE_TARGET="unix:${CONTROL_API_SOCKET}"
+CONTROL_HELPER_SOCKET="/run/interstellar-control/helper.sock"
+
+tailscale_available() { command -v tailscale >/dev/null 2>&1; }
+
+# Same version policy as tailscale_control_version_supported, without its output.
+tailscale_control_version_ok() {
+  tailscale_available || return 1
+  local installed metadata
+  installed="$(tailscale version 2>/dev/null | head -n 1 || true)"
+  metadata="$(tailscale version --daemon --json 2>/dev/null || true)"
+  python3 - "$installed" "$metadata" <<'PYEOF'
+import json, re, sys
+try:
+    value = json.loads(sys.argv[2])
+except ValueError:
+    value = {}
+client = value.get("short") if isinstance(value, dict) else None
+daemon = value.get("daemonLong") if isinstance(value, dict) else None
+def supported(raw, daemon_version=False):
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", raw or "")
+    if not match:
+        return False
+    version = tuple(int(match.group(i)) for i in (1, 2, 3))
+    suffix = match.group(4)
+    release_hashes = bool(daemon_version and suffix and re.fullmatch(r"[tg]?[0-9a-f]{6,}(?:-[tg]?[0-9a-f]{6,})?", suffix))
+    return version > (1, 98, 9) or version == (1, 98, 9) and (not suffix or release_hashes)
+raise SystemExit(0 if client == sys.argv[1] and supported(client) and supported(daemon, True) else 1)
+PYEOF
+}
+
+health_serve_port() { agent_env_value INTERSTELLAR_PORT 2>/dev/null || echo 9127; }
+
+magicdns_name() {
+  tailscale_available || return 0
+  tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(0)
+node = data.get("Self") or {}
+print(str(node.get("DNSName") or "").rstrip("."))
+' 2>/dev/null || true
+}
+
+serve_config_json() {
+  tailscale_available || return 0
+  tailscale serve status --json 2>/dev/null || true
+}
+
+# Emits shell-quoted serve_* assignments describing the effective Serve topology.
+# Callers use: eval "$(serve_state_vars)"
+serve_state_vars() {
+  python3 - "$(serve_config_json)" "$(health_serve_port)" "$CONTROL_SERVE_PORT" \
+              "$CONTROL_SERVE_TARGET" "$CONTROL_CAPABILITY" <<'PYEOF'
+import json, shlex, sys
+raw, health_port, control_port, control_target, capability = sys.argv[1:6]
+try:
+    config = json.loads(raw) if raw.strip() else {}
+except ValueError:
+    config = {}
+if not isinstance(config, dict):
+    config = {}
+web = config.get("Web")
+web = web if isinstance(web, dict) else {}
+
+def entry_for(port):
+    # Serve keys are "<magicdns host>:<port>".
+    for key, value in web.items():
+        if str(key).rsplit(":", 1)[-1] == str(port) and isinstance(value, dict):
+            return key, value
+    return None, None
+
+def root_proxy(entry):
+    handlers = entry.get("Handlers") if isinstance(entry, dict) else None
+    root = handlers.get("/") if isinstance(handlers, dict) else None
+    return root.get("Proxy") if isinstance(root, dict) else None
+
+health_key, health_entry = entry_for(443)
+control_key, control_entry = entry_for(control_port)
+health_proxy = root_proxy(health_entry)
+control_proxy = root_proxy(control_entry)
+expected_health = f"http://127.0.0.1:{health_port}"
+
+if health_entry is None:
+    health_state = "missing"
+elif health_proxy != expected_health:
+    health_state = "wrong-target"
+else:
+    health_state = "ok"
+
+if control_entry is None:
+    control_state = "missing"
+elif control_proxy != control_target:
+    control_state = "wrong-target"
+elif capability not in json.dumps(control_entry):
+    # The field name for accepted app capabilities has changed between Tailscale
+    # releases, so look for the capability anywhere in this handler's config.
+    control_state = "missing-capability"
+else:
+    control_state = "ok"
+
+other = sorted(k for k in web if k and k not in {health_key, control_key})
+for name, value in (("serve_health_key", health_key), ("serve_health_proxy", health_proxy),
+                    ("serve_health_state", health_state), ("serve_control_key", control_key),
+                    ("serve_control_proxy", control_proxy), ("serve_control_state", control_state),
+                    ("serve_other_routes", " ".join(other))):
+    print(f"{name}={shlex.quote(str(value or ''))}")
+PYEOF
+}
+
+control_serve_url() {
+  local host
+  host="$(magicdns_name)"
+  [[ -n "$host" ]] || return 0
+  printf 'https://%s:%s' "$host" "$CONTROL_SERVE_PORT"
+}
+
+# Idempotent. Only writes the Interstellar health handler.
+ensure_health_serve() {
+  local port serve_health_key serve_health_proxy serve_health_state
+  local serve_control_key serve_control_proxy serve_control_state serve_other_routes
+  port="$(health_serve_port)"
+  tailscale_available || { warn "Tailscale is not installed; cannot configure the health listener."; return 1; }
+  eval "$(serve_state_vars)"
+  if [[ "$serve_health_state" == "ok" ]]; then
+    ok "Health Serve already proxies http://127.0.0.1:${port}"
+    return 0
+  fi
+  if [[ "$serve_health_state" == "wrong-target" ]]; then
+    warn "Health Serve proxies ${serve_health_proxy:-nothing}; repairing."
+  else
+    info "Adding the health Serve listener."
+  fi
+  tailscale serve --bg "$port" || { warn "Could not configure the health Serve listener."; return 1; }
+  eval "$(serve_state_vars)"
+  [[ "$serve_health_state" == "ok" ]] || { warn "Health Serve did not reach the expected state."; return 1; }
+  fix "Health Serve configured: https://$(magicdns_name)/ -> http://127.0.0.1:${port}"
+}
+
+# Idempotent. Only writes the Interstellar control handler on :8443 and never
+# removes unrelated Serve routes.
+ensure_control_serve() {
+  local serve_health_key serve_health_proxy serve_health_state
+  local serve_control_key serve_control_proxy serve_control_state serve_other_routes
+  tailscale_available || { warn "Tailscale is not installed; cannot configure the control listener."; return 1; }
+  if ! tailscale_control_version_ok; then
+    warn "Control Serve requires Tailscale 1.98.9 or newer for both the CLI and the running daemon."
+    return 1
+  fi
+  eval "$(serve_state_vars)"
+  case "$serve_control_state" in
+    ok) ok "Control Serve already configured on :${CONTROL_SERVE_PORT}."; return 0 ;;
+    missing) info "Adding the control Serve listener on :${CONTROL_SERVE_PORT}." ;;
+    wrong-target) warn "Control Serve proxies ${serve_control_proxy:-nothing}; repairing." ;;
+    missing-capability) warn "Control Serve does not accept ${CONTROL_CAPABILITY}; repairing." ;;
+  esac
+  tailscale serve --bg --https="$CONTROL_SERVE_PORT" \
+    --accept-app-caps="$CONTROL_CAPABILITY" "$CONTROL_SERVE_TARGET" \
+    || { warn "Could not configure the control Serve listener."; return 1; }
+  # A zero exit status does not prove the effective topology; re-read it.
+  eval "$(serve_state_vars)"
+  if [[ "$serve_control_state" != "ok" ]]; then
+    warn "Control Serve did not reach the expected state (${serve_control_state})."
+    return 1
+  fi
+  fix "Control Serve configured: $(control_serve_url)/ -> ${CONTROL_SERVE_TARGET}"
+}
+
+control_installed() { [[ -f "$CONTROL_API_UNIT" && -f "$CONTROL_POLICY" ]]; }
+
+unit_state() { systemctl is-active "$1" 2>/dev/null || echo "inactive"; }
+
+# Reports local service health, Serve configuration and tailnet authorization as
+# three separate facts. Never claims control works because systemd is active.
+control_show_status() {
+  local serve_health_key serve_health_proxy serve_health_state
+  local serve_control_key serve_control_proxy serve_control_state serve_other_routes
+  local api helper socket url
+  echo "Control service"
+  if ! control_installed; then
+    echo "  Not installed"
+    echo
+    echo "  Install with: Interstellar API / Agent -> Install / repair / upgrade Control API"
+    return
+  fi
+  api="$(unit_state interstellar-control-api)"
+  helper="$(unit_state interstellar-control-helper)"
+  if [[ -S "$CONTROL_API_SOCKET" ]]; then socket="available"; else socket="missing"; fi
+  eval "$(serve_state_vars)"
+  url="$(control_serve_url)"
+  printf '  API service:     %s\n' "$api"
+  printf '  Helper service:  %s\n' "$helper"
+  printf '  API socket:      %s\n' "$socket"
+  case "$serve_control_state" in
+    ok)
+      printf '  Control Serve:   %s/\n' "${url:-configured}"
+      printf '  App capability:  accepted by Serve\n'
+      printf '  Tailnet Grant:   not verifiable locally / test from Home Assistant\n'
+      ;;
+    missing)
+      printf '  Control Serve:   missing\n'
+      printf '  App capability:  not configured\n'
+      printf '  Remote control:  unavailable\n'
+      ;;
+    wrong-target)
+      printf '  Control Serve:   wrong target (%s)\n' "${serve_control_proxy:-none}"
+      printf '  App capability:  unknown\n'
+      printf '  Remote control:  unavailable\n'
+      ;;
+    missing-capability)
+      printf '  Control Serve:   %s/\n' "${url:-configured}"
+      printf '  App capability:  MISSING from Serve\n'
+      printf '  Remote control:  unavailable (Serve strips it, the API returns 403)\n'
+      ;;
+  esac
+  if [[ "$serve_control_state" != "ok" ]]; then
+    echo
+    warn "Repair with: Interstellar API / Agent -> Install / repair / upgrade Control API"
+  fi
+}
+
+# Runs one check as a condition so a failing test never trips `set -e`.
+control_check() {
+  local label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf '[✓] %s\n' "$label"
+  else
+    printf '[✗] %s\n' "$label"
+  fi
+}
+
+control_self_check() {
+  local serve_health_key serve_health_proxy serve_health_state
+  local serve_control_key serve_control_proxy serve_control_state serve_other_routes
+  local url client daemon
+  client="$(tailscale version 2>/dev/null | head -n 1 || true)"
+  daemon="$(tailscale version --daemon --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("daemonLong") or "")
+except Exception:
+    print("")
+' 2>/dev/null || true)"
+  echo "Control Plane Diagnostics"
+  echo
+  echo "Local services"
+  control_check "tailscaled active" systemctl is-active --quiet tailscaled
+  control_check "Tailscale client and daemon >= 1.98.9 (client ${client:-unknown}, daemon ${daemon:-unknown})" \
+    tailscale_control_version_ok
+  control_check "interstellar-control-helper active" \
+    test "$(unit_state interstellar-control-helper)" = active
+  control_check "interstellar-control-api active" \
+    test "$(unit_state interstellar-control-api)" = active
+  control_check "API Unix socket exists" test -S "$CONTROL_API_SOCKET"
+  control_check "Helper Unix socket exists" test -S "$CONTROL_HELPER_SOCKET"
+  echo
+  echo "Serve configuration"
+  eval "$(serve_state_vars)"
+  control_check "Health Serve configured (${serve_health_proxy:-none})" \
+    test "$serve_health_state" = ok
+  control_check "Control Serve configured on :${CONTROL_SERVE_PORT} (${serve_control_proxy:-none})" \
+    test "${serve_control_proxy:-}" = "$CONTROL_SERVE_TARGET"
+  control_check "--accept-app-caps configured" test "$serve_control_state" = ok
+  if [[ -n "$serve_other_routes" ]]; then
+    printf '[i] Other Serve routes preserved: %s\n' "$serve_other_routes"
+  fi
+  echo
+  echo "Tailnet authorization"
+  printf '[?] Tailnet app capability Grant cannot be proven locally\n'
+  echo "    Nothing on this host can read the tailnet policy. Home Assistant"
+  echo "    receiving HTTP 403 means the Grant is missing even when every check"
+  echo "    above passes."
+  echo
+  url="$(control_serve_url)"
+  echo "Control URL:"
+  echo "  ${url:-https://<magicdns-name>:${CONTROL_SERVE_PORT}}"
+  echo
+  echo "Required capability:"
+  echo "  ${CONTROL_CAPABILITY}"
+}
+
+control_grant_guidance() {
+  local host url
+  host="$(magicdns_name)"
+  url="$(control_serve_url)"
+  echo "Tailscale Grant required for Home Assistant"
+  echo
+  echo "The control API refuses every request without the app capability:"
+  echo "  ${CONTROL_CAPABILITY}"
+  echo
+  echo "This Toolbox never edits your tailnet policy. Add a Grant like this in"
+  echo "the Tailscale admin console (Access controls), with src/dst adjusted to"
+  echo "the tags or users you actually use:"
+  echo
+  cat <<EOF
+  {
+    "grants": [
+      {
+        "src": ["tag:home-assistant"],
+        "dst": ["tag:interstellar-server"],
+        "ip": ["tcp:${CONTROL_SERVE_PORT}"],
+        "app": {
+          "${CONTROL_CAPABILITY}": [{}]
+        }
+      }
+    ]
+  }
+EOF
+  echo
+  echo "Check each part before applying:"
+  echo "  src   must match the Home Assistant node's identity (its tag, user or group)."
+  echo "  dst   must match this server${host:+ (${host})}."
+  echo "  ip    must allow tcp:${CONTROL_SERVE_PORT}; network access alone is not enough."
+  echo "  app   grants the capability. Without it Serve strips it and the API returns 403."
+  echo
+  echo "Do not paste this over an existing policy. Merge it into your current grants."
+  echo
+  echo "Home Assistant control URL: ${url:-https://<magicdns-name>:${CONTROL_SERVE_PORT}}"
+}
+
 write_control_helper_python() {
   install -d -o root -g root -m 0755 "$AGENT_DIR"
   cat >"$CONTROL_HELPER_PY" <<'PYEOF'
@@ -2834,7 +3203,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import UUID
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SOCKET_PATH = Path("/run/interstellar-control/helper.sock")
 DB_PATH = Path("/var/lib/interstellar-control/actions.db")
 POLICY_PATH = Path("/etc/interstellar/control-policy.json")
@@ -3235,7 +3604,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 TAILSCALE_CONTROL_MINIMUM_VERSION = "1.98.9"
 CAPABILITY = "interstellarnetwork.nl/cap/server-control"
 API_SOCKET = Path("/run/interstellar-control-api/api.sock")
@@ -3344,7 +3713,13 @@ def send_action(action: str, target: str, principal: str, confirmation: str = ""
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "InterstellarControl/0.1"
+    server_version = f"InterstellarControl/{VERSION}"
+    sys_version = ""
+
+    def version_string(self) -> str:
+        # The default appends the Python runtime version, and joining with an
+        # empty sys_version would leave a trailing space in the header.
+        return self.server_version
 
     def log_message(self, fmt: str, *args) -> None:
         # Action audit is structured; avoid request lines that may contain secrets.
@@ -3568,10 +3943,13 @@ install_control_plane() {
   systemctl enable interstellar-control-helper interstellar-control-api
   systemctl restart interstellar-control-helper
   systemctl restart interstellar-control-api
-  fix "Interstellar control plane v0.2.0 installed."
-  info "Configure a tailnet Grant for interstellarnetwork.nl/cap/server-control."
-  info "Then run: tailscale serve --bg --https=8443 --accept-app-caps=interstellarnetwork.nl/cap/server-control unix:/run/interstellar-control-api/api.sock"
-  info "Add https://YOUR-MAGICDNS-NAME:8443 as the control URL in Home Assistant."
+  fix "Interstellar control plane v0.2.1 installed."
+  # Running services are useless without the Serve listener, so configure it here
+  # instead of printing instructions and hoping the operator runs them.
+  ensure_health_serve || true
+  ensure_control_serve || warn "Control Serve is not configured; Home Assistant cannot reach the control API."
+  echo
+  control_grant_guidance
 }
 
 upgrade_control_plane_noninteractive() {
@@ -3587,6 +3965,8 @@ upgrade_control_plane_noninteractive() {
   systemctl daemon-reload
   systemctl restart interstellar-control-helper
   systemctl restart interstellar-control-api
+  # Repairs a health-only or partially configured Serve topology on upgrade.
+  ensure_control_serve || true
 }
 
 install_health_agent() {
@@ -3606,11 +3986,11 @@ install_health_agent() {
   systemctl enable interstellar-agent
   systemctl restart interstellar-agent
   if [[ -f "$MDNS_ENV" ]]; then
-    sed -i 's/^INTERSTELLAR_AGENT_VERSION=.*/INTERSTELLAR_AGENT_VERSION=3.2.0/' "$MDNS_ENV"
+    sed -i 's/^INTERSTELLAR_AGENT_VERSION=.*/INTERSTELLAR_AGENT_VERSION=3.2.1/' "$MDNS_ENV"
     systemctl restart interstellar-mdns 2>/dev/null || true
   fi
 
-  fix "Read-only health agent v3.2 installed/upgraded."
+  fix "Read-only health agent v3.2.1 installed/upgraded."
   info "Backend: http://127.0.0.1:${port}"
   info "Roles: ${roles}"
   info "Expected services: ${expected}"
@@ -3636,6 +4016,7 @@ agent_show_status() {
   tailscale serve status 2>/dev/null | sed 's/^/  /' || echo "  Not configured"
   tailscale_control_version_supported || true
   echo
+  control_show_status
   echo
   echo "Server policy"
   echo "  Roles:             $(agent_env_value INTERSTELLAR_ROLES 2>/dev/null || echo general)"
@@ -3815,7 +4196,7 @@ INTERSTELLAR_MACHINE_ID=${machine}
 INTERSTELLAR_URL=https://${ts_dns}
 INTERSTELLAR_LAN_IP=${lan_ip}
 INTERSTELLAR_ROLES=${roles}
-INTERSTELLAR_AGENT_VERSION=3.2.0
+INTERSTELLAR_AGENT_VERSION=3.2.1
 EOF
   chmod 0644 "$MDNS_ENV"
   systemctl daemon-reload
@@ -3835,20 +4216,29 @@ agent_disable_discovery() {
 
 agent_enable_tailscale_serve() {
   [[ -f "$AGENT_ENV" ]] || { warn "Install the health agent first."; return; }
-  command -v tailscale >/dev/null 2>&1 || { warn "Tailscale is not installed."; return; }
-  local port
-  port="$(agent_env_value INTERSTELLAR_PORT 2>/dev/null || echo 9127)"
+  tailscale_available || { warn "Tailscale is not installed."; return; }
   clear
-  info "Serving localhost:${port} inside the tailnet."
-  tailscale serve --bg "$port"
+  ensure_health_serve || true
+  if [[ -f "$CONTROL_API_UNIT" ]]; then
+    ensure_control_serve || true
+  fi
   echo
   tailscale serve status || true
 }
 
 agent_disable_tailscale_serve() {
-  command -v tailscale >/dev/null 2>&1 || return
-  tailscale serve off || true
-  fix "Tailscale Serve disabled."
+  tailscale_available || return
+  local port
+  port="$(health_serve_port)"
+  # `tailscale serve off` would also drop the control listener and any unrelated
+  # route this node serves, so only the Interstellar handlers are removed.
+  ui_yesno "Disable Interstellar Serve" \
+    "Remove the Interstellar health and control Serve listeners?\n\nUnrelated Serve routes are kept." || return
+  tailscale serve --https=443 off 2>/dev/null || true
+  tailscale serve --https="$CONTROL_SERVE_PORT" off 2>/dev/null || true
+  fix "Interstellar Serve listeners removed. Local health port ${port} is unchanged."
+  echo
+  tailscale serve status || true
 }
 
 agent_security_model() {
@@ -3908,8 +4298,8 @@ agent_menu() {
       "3" "Install / repair / upgrade Control API" \
       "4" "Change Health API port" \
       "5" "Configure server roles & expected services" \
-      "6" "Enable Tailscale Serve" \
-      "7" "Disable Tailscale Serve" \
+      "6" "Enable Tailscale Serve (health + control)" \
+      "7" "Disable Interstellar Tailscale Serve" \
       "8" "Enable Home Assistant auto-discovery" \
       "9" "Disable Home Assistant auto-discovery" \
       "10" "Test /health" \
@@ -3918,6 +4308,8 @@ agent_menu() {
       "13" "Explain security model" \
       "14" "Restart agents" \
       "15" "Uninstall agents" \
+      "16" "Control plane self-check" \
+      "17" "Show required Tailscale Grant" \
       "0" "Back")" || return
     case "$choice" in
       1) clear; agent_show_status; pause ;;
@@ -3935,6 +4327,8 @@ agent_menu() {
       13) agent_security_model ;;
       14) systemctl restart interstellar-agent interstellar-control-api interstellar-control-helper; ui_msg "API" "Agents restarted." ;;
       15) clear; agent_uninstall; pause ;;
+      16) clear; control_self_check; pause ;;
+      17) clear; control_grant_guidance; pause ;;
       0) return ;;
     esac
   done

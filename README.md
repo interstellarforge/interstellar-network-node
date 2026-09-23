@@ -20,16 +20,28 @@ The optional control API runs as the dedicated `interstellar-control` user on `/
 
 Control requires Tailscale **1.98.9 or newer**. The Toolbox prints the installed CLI, running daemon, and minimum versions and refuses control installation or upgrade if either version is older or unknown. The control API also rejects actions after a downgrade or before a newly upgraded daemon has restarted. Health-only monitoring remains available on older Tailscale versions where Serve works. See [Tailscale’s Serve security bulletin](https://tailscale.com/security-bulletins).
 
-Run `interstellar` → **Interstellar API / Agent** to install or configure both planes. Configure separate Serve listeners for health (default HTTPS port 443) and control (example 8443):
+Run `interstellar` → **Interstellar API / Agent** to install or configure both planes. Installing or repairing the Control API now configures both Serve listeners itself and verifies the result with `tailscale serve status`. The canonical topology is:
+
+| Plane | URL | Backend |
+| --- | --- | --- |
+| Health | `https://<magicdns-name>/` | `http://127.0.0.1:9127` |
+| Control | `https://<magicdns-name>:8443/` | `unix:/run/interstellar-control-api/api.sock` |
+
+The equivalent manual commands, should you need them:
 
 ```bash
 sudo tailscale serve --bg 9127
 sudo tailscale serve --bg --https=8443 \
   --accept-app-caps=interstellarnetwork.nl/cap/server-control \
   unix:/run/interstellar-control-api/api.sock
+tailscale serve status
 ```
 
-Grant the HA Tailscale identity network access to the control port and that app capability. Keep the control listener on Serve, never Funnel. Read [the HA integration guide](https://github.com/interstellarforge/ha-interstellar-network-server-integration#readme) for card and action details.
+The control handler must carry `--accept-app-caps`. Without it Serve strips the capability header and the control API answers every request with `HTTP 403 {"error":"Tailscale control capability required"}` even though both services are running.
+
+Grant the HA Tailscale identity network access to the control port and that app capability; **Interstellar API / Agent → Show required Tailscale Grant** prints a Grant to merge into your policy. Keep the control listener on Serve, never Funnel. Read [the HA integration guide](https://github.com/interstellarforge/ha-interstellar-network-server-integration#readme) for card and action details.
+
+**Interstellar API / Agent → Control plane self-check** reports local services, Serve configuration, and tailnet authorization separately. A local check can never prove the tailnet Grant exists, so it says so rather than guessing.
 
 `/etc/interstellar/control-policy.json` separates `expected_services` from `manageable_services`, and `expected_containers` from `manageable_containers`. SSH and Tailscale service control also require `sensitive_services_opt_in`. Roles influence display only; they do not add arbitrary service permissions.
 

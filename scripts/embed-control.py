@@ -138,10 +138,13 @@ install_control_plane() {{
   systemctl enable interstellar-control-helper interstellar-control-api
   systemctl restart interstellar-control-helper
   systemctl restart interstellar-control-api
-  fix "Interstellar control plane v0.2.0 installed."
-  info "Configure a tailnet Grant for interstellarnetwork.nl/cap/server-control."
-  info "Then run: tailscale serve --bg --https=8443 --accept-app-caps=interstellarnetwork.nl/cap/server-control unix:/run/interstellar-control-api/api.sock"
-  info "Add https://YOUR-MAGICDNS-NAME:8443 as the control URL in Home Assistant."
+  fix "Interstellar control plane v0.2.1 installed."
+  # Running services are useless without the Serve listener, so configure it here
+  # instead of printing instructions and hoping the operator runs them.
+  ensure_health_serve || true
+  ensure_control_serve || warn "Control Serve is not configured; Home Assistant cannot reach the control API."
+  echo
+  control_grant_guidance
 }}
 
 upgrade_control_plane_noninteractive() {{
@@ -157,6 +160,8 @@ upgrade_control_plane_noninteractive() {{
   systemctl daemon-reload
   systemctl restart interstellar-control-helper
   systemctl restart interstellar-control-api
+  # Repairs a health-only or partially configured Serve topology on upgrade.
+  ensure_control_serve || true
 }}
 
 '''

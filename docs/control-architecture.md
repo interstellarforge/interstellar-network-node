@@ -8,6 +8,10 @@ Home Assistant → Tailscale HTTPS Serve :8443 (Grant + app capability)
                → root helper → fixed systemctl / apt / Docker operations
 ```
 
+The Toolbox configures both Serve handlers during control install and repair, then re-reads `tailscale serve status` to confirm the effective topology; a zero exit status is not treated as proof. It writes only the Interstellar handlers and never removes unrelated Serve routes. Disabling Interstellar Serve removes `:443` and `:8443` individually rather than running `tailscale serve off`, which would drop everything the node serves.
+
+Three facts are deliberately kept apart, because conflating them cost real debugging time: the control services can be **active**, the control **Serve listener** can still be missing, and the tailnet **Grant** can still be absent. The last one cannot be observed from the node at all. A node whose Serve handler lacks `--accept-app-caps`, or whose tailnet has no matching Grant, answers `403` on every control request while `systemctl` reports everything healthy.
+
 The health plane is separate: Tailscale Serve :443 → `127.0.0.1:9127` → dynamic-user health agent. Its HTTP class implements GET only. It does not import or connect to the control helper. A failed or unconfigured control service does not stop health polling.
 
 Tailscale **1.98.9 or newer** is required for the control plane because of Unix-socket Serve security fixes. The Toolbox refuses control installation/upgrade unless both the CLI and running `tailscaled` daemon meet that version. The API checks both again before POST actions, including after an upgrade that has not restarted the daemon. The health plane can continue on older versions where its TCP-backed Serve works. The control API has no TCP listener. `tailscaled` runs as root on a normal Debian/Ubuntu install and can reach its mode `0600` Unix socket in a mode `0700` runtime directory. Ordinary local users cannot reach it to forge Tailscale headers. Local root remains trusted. The API requires a nonempty JSON `Tailscale-App-Capabilities` entry for `interstellarnetwork.nl/cap/server-control` on control requests. It records `Tailscale-User-Login` when Serve provides it; tagged nodes have a capability but no user login, and are recorded as `tailscale-tagged-node`. Tailnet policy must restrict which users or tagged nodes get the capability and control-port network access. Never use Funnel for control.
@@ -52,3 +56,15 @@ sudo tailscale serve status
 ```
 
 A direct connection by an ordinary local user to the API socket should fail. A remote control request without the Grant should get 403. A direct health request for a POST action should get HTTP 501; the health process has no POST handler. Inspect `/actions` for audit results.
+
+Always read `tailscale serve status` before changing Serve. The expected output is:
+
+```text
+https://<magicdns-name>
+|-- / proxy http://127.0.0.1:9127
+
+https://<magicdns-name>:8443
+|-- / proxy unix:/run/interstellar-control-api/api.sock
+```
+
+`interstellar` → **Interstellar API / Agent** → **Control plane self-check** checks the same topology and prints the control URL and required capability. `/control` on port 443 is not a supported route; the control plane has only ever been served on its own port, and the Toolbox never configures one.

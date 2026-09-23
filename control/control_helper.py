@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import UUID
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SOCKET_PATH = Path("/run/interstellar-control/helper.sock")
 DB_PATH = Path("/var/lib/interstellar-control/actions.db")
 POLICY_PATH = Path("/etc/interstellar/control-policy.json")

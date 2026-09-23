@@ -115,17 +115,75 @@ class WolTests(unittest.TestCase):
                           "mac_address": "aa:bb:cc:dd:ee:ff", "broadcast_address": "192.168.1.255"}, result)
         self.assertFalse(hasattr(agent.Handler, "do_POST"))
 
+    def status(self, version="1.98.9", daemon="1.98.9", services=None, installed=True):
+        services = services or {"interstellar-control-api": "active",
+                                "interstellar-control-helper": "active"}
+        with patch.object(agent.os.path, "exists", return_value=installed):
+            return agent.control_plane_status({"version": version, "daemon_version": daemon}, services)
+
     def test_health_reports_control_unavailable_without_losing_telemetry(self):
-        old = agent.control_plane_status({"version": "1.98.8", "daemon_version": "1.98.8"},
-                                         {"interstellar-control-api": "active"})
+        old = self.status(version="1.98.8", daemon="1.98.8")
         self.assertFalse(old["control_available"])
         self.assertEqual("1.98.9", old["tailscale_control_minimum_version"])
-        mixed = agent.control_plane_status({"version": "1.98.9", "daemon_version": "1.98.8"},
-                                           {"interstellar-control-api": "active"})
+        self.assertFalse(old["tailscale_version_supported"])
+        mixed = self.status(version="1.98.9", daemon="1.98.8")
         self.assertFalse(mixed["control_available"])
-        patched = agent.control_plane_status({"version": "1.98.9", "daemon_version": "1.98.9"},
-                                             {"interstellar-control-api": "active"})
+        patched = self.status()
         self.assertTrue(patched["control_available"])
+
+    def test_control_plane_status_separates_local_facts(self):
+        """Local service state, Serve expectation and HA authorization are distinct.
+
+        The health agent can see the first two and can never see the third, so it
+        must not publish anything that reads as "control works for Home Assistant".
+        """
+        ready = self.status()
+        self.assertTrue(ready["installed"])
+        self.assertTrue(ready["api_service_active"])
+        self.assertTrue(ready["helper_service_active"])
+        self.assertTrue(ready["serve_expected"])
+        self.assertTrue(ready["control_service_ready"])
+        self.assertIsNone(ready["control_service_unavailable_reason"])
+        # No field may claim remote authorization; only the control API knows.
+        self.assertNotIn("control_authorized_from_ha", ready)
+
+        absent = self.status(installed=False)
+        self.assertFalse(absent["installed"])
+        self.assertFalse(absent["serve_expected"])
+        self.assertEqual("Control plane is not installed", absent["control_service_unavailable_reason"])
+
+        stopped = self.status(services={"interstellar-control-api": "inactive",
+                                        "interstellar-control-helper": "active"})
+        self.assertFalse(stopped["api_service_active"])
+        self.assertTrue(stopped["helper_service_active"])
+        # Serve is still expected to exist; only the service is down.
+        self.assertTrue(stopped["serve_expected"])
+        self.assertEqual("Control API service is not active",
+                         stopped["control_service_unavailable_reason"])
+
+        helper_down = self.status(services={"interstellar-control-api": "active",
+                                            "interstellar-control-helper": "failed"})
+        self.assertEqual("Control helper service is not active",
+                         helper_down["control_service_unavailable_reason"])
+
+    def test_control_services_fall_back_to_runtime_directory(self):
+        """`systemctl show` can be unavailable to the sandboxed agent.
+
+        These units run as `python3`, so /proc comm matching cannot find them and
+        the old fallback reported a running control API as inactive. systemd
+        removes RuntimeDirectory when a unit stops, so the directory is the
+        reliable unprivileged signal.
+        """
+        with patch.object(agent, "run", return_value=""), \
+             patch.object(agent.os.path, "isdir", return_value=True):
+            self.assertEqual("active", agent.service_state("interstellar-control-api"))
+            self.assertEqual("active", agent.service_state("interstellar-control-helper"))
+        with patch.object(agent, "run", return_value=""), \
+             patch.object(agent.os.path, "isdir", return_value=False):
+            self.assertEqual("inactive", agent.service_state("interstellar-control-api"))
+        # systemd remains authoritative when it answers.
+        with patch.object(agent, "run", return_value="active"):
+            self.assertEqual("active", agent.service_state("interstellar-control-api"))
 
 
 if __name__ == "__main__":

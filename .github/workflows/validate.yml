@@ -20,3 +20,15 @@ jobs:
           bash -n install.sh
           bash -n scripts/release.sh
           bash -n scripts/configure-repository.sh
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Check embedded control sources are current
+        run: |
+          python3 scripts/embed-control.py
+          git diff --exit-code toolbox/interstellar-network-toolbox.sh
+
+      - name: Unit tests
+        run: python3 -m unittest tests.test_serve tests.test_control tests.test_wol
