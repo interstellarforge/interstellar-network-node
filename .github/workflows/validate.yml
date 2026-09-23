@@ -31,4 +31,4 @@ jobs:
           git diff --exit-code toolbox/interstellar-network-toolbox.sh
 
       - name: Unit tests
-        run: python3 -m unittest tests.test_serve tests.test_control tests.test_wol
+        run: python3 -m unittest tests.test_serve tests.test_control tests.test_wol tests.test_grant

@@ -39,7 +39,14 @@ tailscale serve status
 
 The control handler must carry `--accept-app-caps`. Without it Serve strips the capability header and the control API answers every request with `HTTP 403 {"error":"Tailscale control capability required"}` even though both services are running.
 
-Grant the HA Tailscale identity network access to the control port and that app capability; **Interstellar API / Agent → Show required Tailscale Grant** prints a Grant to merge into your policy. Keep the control listener on Serve, never Funnel. Read [the HA integration guide](https://github.com/interstellarforge/ha-interstellar-network-server-integration#readme) for card and action details.
+The HA Tailscale identity also needs network access to the control port **and** the app capability. Two menu entries cover this:
+
+- **Show required Tailscale Grant** prints a Grant to merge into your policy by hand.
+- **Configure tailnet Grant (Tailscale API)** applies it for you. It shows a diff, has Tailscale validate the result, asks you to type the tailnet name, and writes with an `If-Match` precondition so a concurrent admin-console edit aborts rather than being overwritten. Running it again when the grant exists changes nothing. Your policy file's existing rules, formatting and comments are preserved; if the grant cannot be placed with certainty the Toolbox refuses and prints the snippet instead.
+
+  The credential needs the **`policy_file`** scope (admin console → Settings → Keys). It is passed by environment, never argv, and is never stored on disk.
+
+Keep the control listener on Serve, never Funnel. Read [the HA integration guide](https://github.com/interstellarforge/ha-interstellar-network-server-integration#readme) for card and action details.
 
 **Interstellar API / Agent → Control plane self-check** reports local services, Serve configuration, and tailnet authorization separately. A local check can never prove the tailnet Grant exists, so it says so rather than guessing.
 

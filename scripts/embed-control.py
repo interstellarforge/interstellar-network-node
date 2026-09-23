@@ -6,6 +6,7 @@ start = source.index('write_control_helper_python() {')
 end = source.index('install_health_agent() {', start)
 helper = (root / 'control/control_helper.py').read_text().rstrip()
 api = (root / 'control/control_api.py').read_text().rstrip()
+grant = (root / 'toolbox/tailnet-grant.py').read_text().rstrip()
 block = f'''write_control_helper_python() {{
   install -d -o root -g root -m 0755 "$AGENT_DIR"
   cat >"$CONTROL_HELPER_PY" <<'PYEOF'
@@ -162,6 +163,13 @@ upgrade_control_plane_noninteractive() {{
   systemctl restart interstellar-control-api
   # Repairs a health-only or partially configured Serve topology on upgrade.
   ensure_control_serve || true
+}}
+
+# The grant tool runs from stdin so no credential ever reaches a file or argv.
+run_tailnet_grant() {{
+  python3 - "$@" <<'PYEOF'
+{grant}
+PYEOF
 }}
 
 '''
