@@ -1899,7 +1899,7 @@ def cpu_percentages() -> dict[str, float | None]:
     except Exception:
         return {"used_percent": None, "iowait_percent": None, "steal_percent": None}
 
-    deltas = [b - a for a, b in zip(first, second, strict=False)]
+    deltas = [b - a for a, b in zip(first, second)]
     total = sum(deltas)
     if total <= 0:
         return {"used_percent": None, "iowait_percent": None, "steal_percent": None}
