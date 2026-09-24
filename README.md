@@ -1,6 +1,18 @@
 # Interstellar Network node
 
-The root-only `interstellar` toolbox manages Debian and Ubuntu servers. Toolbox 4.5.0 embeds health agent 3.2.0 and control service 0.2.0.
+The root-only `interstellar` toolbox manages Debian and Ubuntu servers. Toolbox 4.6.2 embeds health agent 3.2.2 and control service 0.2.1.
+
+## Supported runtime
+
+| Requirement | Minimum | Notes |
+| --- | --- | --- |
+| Python | **3.9** | Debian 11 and most Proxmox LXC templates ship 3.9. Everything that runs on a node is 3.9-compatible and CI tests against 3.9 and 3.13. |
+| OS | Debian 11+ / Ubuntu 20.04+ | Bare metal, VM, or LXC/Docker container. |
+| Tailscale | 1.98.9+ | Control plane only; health monitoring works on older versions. |
+
+Installation refuses to proceed on an interpreter older than 3.9 rather than writing code that cannot run. **Interstellar API / Agent → Show status** and **Control plane self-check** both report the detected version.
+
+Containers are supported. Hardware telemetry that a container cannot see — temperature sensors, block devices, physical NIC Wake-on-LAN — is reported as absent rather than treated as a failure, and an LXC or Docker guest is detected even when `systemd-detect-virt` is not installed.
 
 ## Install
 
@@ -15,6 +27,8 @@ The toolbox is installed at `/usr/local/sbin/interstellar-toolbox` with mode `07
 ## Health and control
 
 The health agent runs with a dynamic unprivileged user and listens only on `127.0.0.1:9127`. It offers GET `/`, `/health`, `/stats`, and `/metrics`. It cannot reboot, install packages, or control services or containers.
+
+A single failing collector no longer removes the whole response. `/stats` keeps returning valid JSON with `"degraded": true` and a `collector_errors` map naming the failed collectors by exception type; `/health` reports `degraded`. Only the exception type is published, since messages can carry filesystem paths and this endpoint is unauthenticated — full detail goes to the journal. If the payload cannot be built at all, the agent answers HTTP 500 with JSON instead of closing the connection.
 
 The optional control API runs as the dedicated `interstellar-control` user on `/run/interstellar-control-api/api.sock` (mode `0600`, private directory). Tailscale Serve is the only remote entry point. It requires the `interstellarnetwork.nl/cap/server-control` app capability. The separate root helper listens on `/run/interstellar-control/helper.sock` (mode `0660`) and verifies the peer UID. The helper accepts only named actions and root-owned policy targets. It stores a bounded SQLite audit history in `/var/lib/interstellar-control/actions.db` (mode `0640`).
 

@@ -26,6 +26,7 @@ HOST = "atlas.tail24b95.ts.net"
 
 # Functions under test, lifted out of the root-only Toolbox.
 FUNCTIONS = (
+    "python_version", "python_supported",
     "tailscale_available", "tailscale_control_version_ok", "health_serve_port",
     "magicdns_name", "serve_config_json", "serve_state_vars", "control_serve_url",
     "ensure_health_serve", "ensure_control_serve", "control_installed", "unit_state",
@@ -54,6 +55,9 @@ CONTROL_SERVE_TARGET="unix:${CONTROL_API_SOCKET}"
 CONTROL_HELPER_SOCKET="/run/interstellar-control/helper.sock"
 CONTROL_API_UNIT="${CONTROL_API_UNIT:-/nonexistent}"
 CONTROL_POLICY="${CONTROL_POLICY:-/nonexistent}"
+PYTHON_MINIMUM_MAJOR=3
+PYTHON_MINIMUM_MINOR=9
+PYTHON_MINIMUM="3.9"
 """.replace("__CAPABILITY__", CAPABILITY)
 
 # Stub tailscale. `serve --bg` rewrites the recorded config the way the real CLI
@@ -270,6 +274,8 @@ class ServeTestCase(unittest.TestCase):
         web = {f"{HOST}:443": health_entry(), f"{HOST}:8443": control_entry()}
         result = self.run_shell("control_self_check", web=web)
         self.assertEqual(0, result.returncode, result.stderr)
+        # The runtime section must name the interpreter it actually found.
+        self.assertIn("python3 >= 3.9", result.stdout)
         self.assertIn("[✓] Control Serve configured on :8443", result.stdout)
         self.assertIn("[✓] --accept-app-caps configured", result.stdout)
         self.assertIn("[?] Tailnet app capability Grant cannot be proven locally", result.stdout)

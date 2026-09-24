@@ -116,6 +116,7 @@ install_control_plane() {{
     return 1
   fi
   install_pkg python3
+  require_supported_python || return 1
   if ! getent group interstellar-control >/dev/null; then
     groupadd --system interstellar-control
   fi
@@ -154,6 +155,8 @@ upgrade_control_plane_noninteractive() {{
     warn "Control upgrade paused until Tailscale is 1.98.9 or newer."
     return 1
   fi
+  # Never overwrite working code with sources this interpreter cannot run.
+  require_supported_python || return 1
   write_control_helper_python
   write_control_api_python
   write_control_helper_unit

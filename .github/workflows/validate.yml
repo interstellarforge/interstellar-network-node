@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  shell:
+    name: Shell
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -21,14 +22,58 @@ jobs:
           bash -n scripts/release.sh
           bash -n scripts/configure-repository.sh
 
+      - name: ShellCheck (errors only)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=error \
+            toolbox/interstellar-network-toolbox.sh \
+            install.sh \
+            scripts/release.sh \
+            scripts/configure-repository.sh
+
+      - name: Whitespace errors
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD --
+
+  generated:
+    name: Embedded sources
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-
-      - name: Check embedded control sources are current
+      - name: Embedded control sources must be current
         run: |
           python3 scripts/embed-control.py
           git diff --exit-code toolbox/interstellar-network-toolbox.sh
 
-      - name: Unit tests
-        run: python3 -m unittest tests.test_serve tests.test_control tests.test_wol tests.test_grant
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the supported floor: Debian 11 and Proxmox LXC guests ship it,
+        # and a 3.10-only construct once broke /health and /stats there while
+        # the service still reported active. 3.13 tracks current Debian/Ubuntu.
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Report interpreter
+        run: python3 -c 'import sys; print(sys.version)'
+
+      - name: Compile standalone sources
+        run: python3 -m compileall -q control toolbox/tailnet-grant.py scripts
+
+      - name: Python 3.9 compatibility guard
+        run: python3 -m unittest tests.test_py39_compat
+
+      - name: Health agent endpoint regression tests
+        run: python3 -m unittest tests.test_agent_endpoints
+
+      - name: Agent, control and Serve tests
+        run: python3 -m unittest tests.test_wol tests.test_control tests.test_serve tests.test_grant

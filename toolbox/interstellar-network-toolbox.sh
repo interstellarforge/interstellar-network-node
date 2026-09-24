@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Supports Debian and Ubuntu.
 # Start without arguments for the interactive menu.
 
-TOOLBOX_VERSION="4.6.1"
+TOOLBOX_VERSION="4.6.2"
 BACKUP_DIR="/var/backups/interstellar-toolbox"
 SSH_DROPIN="/etc/ssh/sshd_config.d/99-interstellar-hardening.conf"
 MANAGER_INSTALL_PATH="/usr/local/sbin/interstellar-toolbox"
@@ -1730,7 +1730,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-VERSION = "3.2.1"
+VERSION = "3.2.2"
 BIND = "127.0.0.1"
 PORT = int(os.environ.get("INTERSTELLAR_PORT", "9127"))
 ROLES = [x.strip() for x in os.environ.get("INTERSTELLAR_ROLES", "general").split(",") if x.strip()]
@@ -1774,6 +1774,22 @@ def run(cmd: list[str], timeout: float = 3.0) -> str:
         return process.stdout.strip()
     except Exception:
         return ""
+
+
+_fqdn_cache: str | None = None
+
+
+def host_fqdn() -> str:
+    """Cached because socket.getfqdn() does a reverse lookup.
+
+    Where reverse DNS is slow or unreachable that blocks for seconds on every
+    single request, and Home Assistant polls /stats every 30 seconds. The FQDN
+    does not change while the agent is running.
+    """
+    global _fqdn_cache
+    if _fqdn_cache is None:
+        _fqdn_cache = socket.getfqdn()
+    return _fqdn_cache
 
 
 def now_utc() -> str:
@@ -1872,8 +1888,43 @@ def service_state(name: str) -> str:
     return "active" if process_running(processes) else "inactive"
 
 
+def container_type() -> str | None:
+    """Detect a container without systemd-detect-virt.
+
+    Minimal LXC images often lack systemd-detect-virt, and reporting such a host
+    as bare metal is wrong in a way that matters: it implies hardware telemetry
+    and Wake-on-LAN that can never work there.
+    """
+    if os.path.exists("/.dockerenv"):
+        return "docker"
+    marker = read_text("/run/systemd/container")
+    if marker:
+        return marker.strip()
+    try:
+        with open("/proc/1/environ", "rb") as handle:
+            for entry in handle.read().split(b"\0"):
+                if entry.startswith(b"container="):
+                    return entry.split(b"=", 1)[1].decode(errors="replace") or None
+    except OSError:
+        pass
+    cgroup = read_text("/proc/1/cgroup") or ""
+    if "/lxc/" in cgroup or "lxc.payload" in cgroup:
+        return "lxc"
+    if "/docker/" in cgroup or "containerd" in cgroup:
+        return "docker"
+    return None
+
+
 def virtualization() -> str:
-    return run([DETECT_VIRT], timeout=1.0) or "none"
+    detected = run([DETECT_VIRT], timeout=1.0)
+    if detected:
+        return detected
+    return container_type() or "none"
+
+
+def is_container() -> bool:
+    return virtualization() in {"lxc", "lxc-libvirt", "docker", "podman", "systemd-nspawn",
+                                "container-other", "rkt", "openvz"}
 
 
 def cpu_model() -> str | None:
@@ -2410,6 +2461,11 @@ def control_plane_status(tailscale: dict[str, Any], services: dict[str, str]) ->
 
 def wake_on_lan_stats() -> dict[str, Any]:
     result = {"supported": False, "enabled": False, "interface": None, "mac_address": None}
+    if is_container():
+        # A container has no physical NIC of its own to wake, and the host is
+        # what would actually need waking.
+        result["unavailable_reason"] = "Wake-on-LAN does not apply inside a container"
+        return result
     try:
         with open("/etc/interstellar/wol.json", encoding="utf-8") as handle:
             config = json.load(handle)
@@ -2509,78 +2565,118 @@ def api_info() -> dict[str, Any]:
     }
 
 
-def collect_stats() -> dict[str, Any]:
-    os_release = read_os_release()
-    try:
-        load = os.getloadavg()
-        load_object = {"1m": round(load[0], 2), "5m": round(load[1], 2), "15m": round(load[2], 2)}
-    except OSError:
-        load_object = {}
+def safe_collect(errors: dict[str, str], name: str, collector, default):
+    """Run one telemetry collector; a failure degrades that field only.
 
-    uptime = uptime_seconds()
-    addresses = ipv4_addresses()
-    filesystems = filesystem_stats()
-    cpu = cpu_percentages()
-    services, expected_problems = service_stats()
-    tailscale = tailscale_status()
-    failed = failed_units()
+    A single broken collector used to escape the request handler and close the
+    socket, so the whole response vanished. The caller gets `default` instead
+    and the failure is recorded.
+
+    The response carries only the exception type. Messages routinely embed
+    filesystem paths and command output, which must not leave the host through
+    an unauthenticated endpoint; the full repr goes to the journal.
+    """
+    try:
+        return collector()
+    except Exception as err:  # noqa: BLE001 - one collector must not sink the response
+        errors[name] = type(err).__name__
+        print(f"collector {name} failed: {err!r}", flush=True)
+        return default
+
+
+def collect_stats() -> dict[str, Any]:
+    errors: dict[str, str] = {}
+    os_release = safe_collect(errors, "os_release", read_os_release, {})
+
+    def load_average() -> dict[str, float]:
+        load = os.getloadavg()
+        return {"1m": round(load[0], 2), "5m": round(load[1], 2), "15m": round(load[2], 2)}
+
+    load_object = safe_collect(errors, "load", load_average, {})
+    uptime = safe_collect(errors, "uptime", uptime_seconds, None)
+    addresses = safe_collect(errors, "addresses", ipv4_addresses, [])
+    filesystems = safe_collect(errors, "filesystems", filesystem_stats, [])
+    cpu = safe_collect(errors, "cpu", cpu_percentages,
+                       {"used_percent": None, "iowait_percent": None, "steal_percent": None})
+    services, expected_problems = safe_collect(errors, "services", service_stats, ({}, []))
+    tailscale = safe_collect(errors, "tailscale", tailscale_status, {})
+    failed = safe_collect(errors, "failed_units", failed_units, [])
+    memory = safe_collect(errors, "memory", memory_stats, {})
+    disk_root = safe_collect(errors, "disk_root", lambda: root_disk_stats(filesystems), {})
+    disk_io = safe_collect(errors, "disk_io", disk_io_stats, [])
+    temperatures = safe_collect(errors, "temperatures", thermal_stats, [])
+    interfaces = safe_collect(errors, "interfaces", network_stats, [])
+    listening = safe_collect(errors, "listening_tcp", listening_tcp, [])
+    updates = safe_collect(errors, "updates", package_update_stats, {})
+    ntp = safe_collect(errors, "time", ntp_status, {})
+    wol = safe_collect(errors, "wake_on_lan", wake_on_lan_stats, {})
+    roles = safe_collect(errors, "role_metadata", role_metadata,
+                         {"roles": ROLES, "configured_expected_services": EXPECTED_SERVICES,
+                          "expected_services": EXPECTED_SERVICES, "manageable_services": []})
 
     return {
+        # `status` describes payload validity, not telemetry health, because
+        # Home Assistant rejects any /stats payload whose status is not "ok".
+        # Partial collector failures are reported by `degraded` instead.
         "status": "ok",
+        "degraded": bool(errors),
+        "collector_errors": errors,
         "agent_version": VERSION,
         "timestamp_utc": now_utc(),
         "api": api_info(),
         "host": {
-            "machine_id": machine_id(),
+            "machine_id": safe_collect(errors, "machine_id", machine_id, None),
             "hostname": socket.gethostname(),
-            "fqdn": socket.getfqdn(),
+            "fqdn": safe_collect(errors, "fqdn", host_fqdn, ""),
             "os": os_release.get("PRETTY_NAME", platform.platform()),
             "os_id": os_release.get("ID"),
             "os_version": os_release.get("VERSION_ID"),
             "kernel": platform.release(),
             "architecture": platform.machine(),
-            "virtualization": virtualization(),
-            "roles": role_metadata()["roles"],
+            "virtualization": safe_collect(errors, "virtualization", virtualization, "unknown"),
+            "roles": roles["roles"],
             "uptime_seconds": uptime,
             "uptime_human": human_duration(uptime),
-            "boot_time_utc": boot_time_utc(),
+            "boot_time_utc": safe_collect(errors, "boot_time", boot_time_utc, None),
         },
         "cpu": {
-            "model": cpu_model(),
+            "model": safe_collect(errors, "cpu_model", cpu_model, None),
             "count": os.cpu_count(),
             "used_percent": cpu["used_percent"],
             "iowait_percent": cpu["iowait_percent"],
             "steal_percent": cpu["steal_percent"],
             "load": load_object,
         },
-        "memory": memory_stats(),
-        "disk_root": root_disk_stats(filesystems),
+        "memory": memory,
+        "disk_root": disk_root,
         "filesystems": filesystems,
-        "disk_io": disk_io_stats(),
-        "temperatures": thermal_stats(),
+        "disk_io": disk_io,
+        "temperatures": temperatures,
         "network": {
             "addresses": addresses,
             "tailscale": tailscale,
-            "interfaces": network_stats(),
-            "tailscale_ipv4": tailscale_ipv4(addresses),
-            "default_route": default_route(),
-            "listening_tcp": listening_tcp(),
+            "interfaces": interfaces,
+            "tailscale_ipv4": safe_collect(errors, "tailscale_ipv4",
+                                           lambda: tailscale_ipv4(addresses), None),
+            "default_route": safe_collect(errors, "default_route", default_route, None),
+            "listening_tcp": listening,
         },
         "services": services,
-        "control_plane": control_plane_status(tailscale, services),
-        "wake_on_lan": wake_on_lan_stats(),
+        "control_plane": safe_collect(errors, "control_plane",
+                                      lambda: control_plane_status(tailscale, services), {}),
+        "wake_on_lan": wol,
         "service_policy": {
-            **role_metadata(),
+            **roles,
             "problems": expected_problems,
             "healthy": not expected_problems,
         },
-        "updates": package_update_stats(),
-        "time": ntp_status(),
+        "updates": updates,
+        "time": ntp,
         "system": {
             "reboot_required": os.path.exists("/var/run/reboot-required"),
             "failed_systemd_units": len(failed),
             "failed_units": failed,
-            "oom_kills_since_boot": oom_kills_since_boot(),
+            "oom_kills_since_boot": safe_collect(errors, "oom_kills", oom_kills_since_boot, None),
         },
     }
 
@@ -2591,14 +2687,17 @@ def minimal_health() -> dict[str, Any]:
     failures = stats.get("system", {}).get("failed_systemd_units", 0)
     expected_healthy = stats.get("service_policy", {}).get("healthy", True)
     ntp = stats.get("time", {}).get("synchronized")
+    collector_errors = stats.get("collector_errors", {})
     healthy = (
         failures == 0
         and expected_healthy
         and ntp is not False
         and (root_used is None or root_used < 95)
+        and not collector_errors
     )
     return {
         "status": "ok" if healthy else "degraded",
+        "collector_errors": collector_errors,
         "agent_version": VERSION,
         "timestamp_utc": stats["timestamp_utc"],
         "machine_id": stats["host"].get("machine_id"),
@@ -2705,7 +2804,7 @@ def prometheus(stats: dict[str, Any]) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "InterstellarAgent/3.2"
+    server_version = f"InterstellarAgent/{VERSION}"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print("%s - %s" % (self.address_string(), fmt % args), flush=True)
@@ -2720,7 +2819,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        path = self.path.split("?", 1)[0]
+        # Never let an exception escape: the default behaviour closes the socket
+        # and the caller sees "Empty reply from server" with no explanation.
+        try:
+            self.route(self.path.split("?", 1)[0])
+        except Exception as err:  # noqa: BLE001 - always answer with JSON
+            print(f"request for {self.path!r} failed: {err!r}", flush=True)
+            try:
+                # Detail stays in the journal; this endpoint is unauthenticated.
+                self.json_response(500, {"status": "error", "error": "internal_error",
+                                         "agent_version": VERSION})
+            except OSError:
+                pass
+
+    def route(self, path: str) -> None:
         if path == "/":
             self.json_response(
                 200,
@@ -2861,6 +2973,42 @@ CONTROL_CAPABILITY="interstellarnetwork.nl/cap/server-control"
 CONTROL_API_SOCKET="/run/interstellar-control-api/api.sock"
 CONTROL_SERVE_TARGET="unix:${CONTROL_API_SOCKET}"
 CONTROL_HELPER_SOCKET="/run/interstellar-control/helper.sock"
+
+# ---------------- Python runtime support ----------------
+#
+# The agent and control services run on the target's system python3. Debian 11
+# ships 3.9, which is the floor: a 3.10-only construct reached a 3.9 container
+# and broke /health and /stats while the service still looked active.
+
+PYTHON_MINIMUM_MAJOR=3
+PYTHON_MINIMUM_MINOR=9
+PYTHON_MINIMUM="${PYTHON_MINIMUM_MAJOR}.${PYTHON_MINIMUM_MINOR}"
+
+python_version() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null
+}
+
+python_supported() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (${PYTHON_MINIMUM_MAJOR}, ${PYTHON_MINIMUM_MINOR}) else 1)" 2>/dev/null
+}
+
+# Fail before writing code the interpreter cannot run.
+require_supported_python() {
+  local version
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 is not installed. Interstellar requires Python ${PYTHON_MINIMUM} or newer."
+    return 1
+  fi
+  if python_supported; then
+    return 0
+  fi
+  version="$(python_version || echo unknown)"
+  warn "Python ${version} is older than the supported minimum ${PYTHON_MINIMUM}."
+  warn "Installation stopped; the agent and control service would not run correctly."
+  return 1
+}
 
 tailscale_available() { command -v tailscale >/dev/null 2>&1; }
 
@@ -3106,6 +3254,10 @@ except Exception:
     print("")
 ' 2>/dev/null || true)"
   echo "Control Plane Diagnostics"
+  echo
+  echo "Runtime"
+  control_check "python3 >= ${PYTHON_MINIMUM} (detected $(python_version || echo 'not installed'))" \
+    python_supported
   echo
   echo "Local services"
   control_check "tailscaled active" systemctl is-active --quiet tailscaled
@@ -4008,6 +4160,7 @@ install_control_plane() {
     return 1
   fi
   install_pkg python3
+  require_supported_python || return 1
   if ! getent group interstellar-control >/dev/null; then
     groupadd --system interstellar-control
   fi
@@ -4046,6 +4199,8 @@ upgrade_control_plane_noninteractive() {
     warn "Control upgrade paused until Tailscale is 1.98.9 or newer."
     return 1
   fi
+  # Never overwrite working code with sources this interpreter cannot run.
+  require_supported_python || return 1
   write_control_helper_python
   write_control_api_python
   write_control_helper_unit
@@ -4472,6 +4627,7 @@ PYEOF
 
 install_health_agent() {
   install_pkg python3
+  require_supported_python || return 1
   local port roles expected
   port="$(agent_env_value INTERSTELLAR_PORT 2>/dev/null || true)"
   roles="$(agent_env_value INTERSTELLAR_ROLES 2>/dev/null || true)"
@@ -4487,11 +4643,11 @@ install_health_agent() {
   systemctl enable interstellar-agent
   systemctl restart interstellar-agent
   if [[ -f "$MDNS_ENV" ]]; then
-    sed -i 's/^INTERSTELLAR_AGENT_VERSION=.*/INTERSTELLAR_AGENT_VERSION=3.2.1/' "$MDNS_ENV"
+    sed -i 's/^INTERSTELLAR_AGENT_VERSION=.*/INTERSTELLAR_AGENT_VERSION=3.2.2/' "$MDNS_ENV"
     systemctl restart interstellar-mdns 2>/dev/null || true
   fi
 
-  fix "Read-only health agent v3.2.1 installed/upgraded."
+  fix "Read-only health agent v3.2.2 installed/upgraded."
   info "Backend: http://127.0.0.1:${port}"
   info "Roles: ${roles}"
   info "Expected services: ${expected}"
@@ -4518,6 +4674,15 @@ agent_show_status() {
   tailscale_control_version_supported || true
   echo
   control_show_status
+  echo
+  echo "Python runtime"
+  if python_supported; then
+    echo "  Python:    $(python_version)"
+    echo "  Supported: yes (minimum ${PYTHON_MINIMUM})"
+  else
+    echo "  Python:    $(python_version || echo 'not installed')"
+    echo "  Supported: NO (minimum ${PYTHON_MINIMUM})"
+  fi
   echo
   echo "Server policy"
   echo "  Roles:             $(agent_env_value INTERSTELLAR_ROLES 2>/dev/null || echo general)"
@@ -4697,7 +4862,7 @@ INTERSTELLAR_MACHINE_ID=${machine}
 INTERSTELLAR_URL=https://${ts_dns}
 INTERSTELLAR_LAN_IP=${lan_ip}
 INTERSTELLAR_ROLES=${roles}
-INTERSTELLAR_AGENT_VERSION=3.2.1
+INTERSTELLAR_AGENT_VERSION=3.2.2
 EOF
   chmod 0644 "$MDNS_ENV"
   systemctl daemon-reload

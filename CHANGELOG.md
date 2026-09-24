@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.6.2
+
+- Health agent 3.2.2. Keep `/health` and `/stats` answering when a telemetry collector fails. A collector exception used to escape the request handler and close the socket, so callers saw `curl: (52) Empty reply from server` with no explanation while the service still reported `active`. Each collector is now isolated: the response stays valid JSON, carries `"degraded": true` and a `collector_errors` map, and unaffected telemetry is still returned. Only the exception type is published — messages can contain filesystem paths and the endpoint is unauthenticated — with full detail logged to the journal. A total failure returns HTTP 500 with JSON instead of dropping the connection.
+- Detect LXC and Docker guests even without `systemd-detect-virt`, via `/run/systemd/container`, PID 1's environment, `/proc/1/cgroup` and `/.dockerenv`. Such hosts previously reported `virtualization: none`, implying hardware and Wake-on-LAN they do not have. Wake-on-LAN now reports explicitly that it does not apply inside a container.
+- Cache the host FQDN. `socket.getfqdn()` performs a reverse lookup that blocks for seconds where reverse DNS is slow or unreachable, and it ran on every `/stats` request while Home Assistant polls every 30 seconds.
+- Refuse installation and upgrade on Python older than 3.9 instead of writing sources the interpreter cannot run, and report the detected Python version in **Show status** and **Control plane self-check**.
+- Add a Python 3.9 compatibility guard covering every runtime source, including the Python embedded in this script, and run the full suite against Python 3.9 and 3.13 in CI. Add health endpoint regression tests that exercise `/`, `/health` and `/stats` over a real socket with the real CPU collector.
+
+## 4.6.1
+
+- Fix `TypeError: zip() takes no keyword arguments` on Python 3.9. `cpu_percentages()` used `zip(..., strict=False)`, which requires Python 3.10, so `/health` and `/stats` failed on Debian 11 and Proxmox LXC guests while `/` and the service status still looked healthy. `strict=False` is the default, so removing it preserves behaviour.
+
 ## 4.6.0
 
 - Fix control installation and repair leaving Tailscale Serve unconfigured. The Toolbox printed the `tailscale serve` command and expected the operator to run it, so Atlas and Jupiter ran healthy control services that Home Assistant could never reach. Install and upgrade now configure the health and control Serve handlers idempotently and verify the effective topology with `tailscale serve status` instead of trusting the command's exit status.

@@ -1,5 +1,7 @@
 # Control architecture and security boundary
 
+Every component that runs on a node targets **Python 3.9 or newer**, the version Debian 11 and most Proxmox LXC templates ship. A 3.10-only `zip(strict=)` once reached a 3.9 container and broke `/health` and `/stats` while the unit still reported `active`, because `from __future__ import annotations` defers the 3.10 union annotations until something actually calls the collector. `tests/test_py39_compat.py` now parses every runtime source, including the Python embedded in the Toolbox, at `feature_version=(3, 9)` and rejects post-3.9 constructs; CI runs the suite on 3.9 and 3.13. Installation refuses an older interpreter rather than deploying code it cannot run.
+
 ```text
 Home Assistant → Tailscale HTTPS Serve :8443 (Grant + app capability)
                → /run/interstellar-control-api/api.sock (private HTTP Unix socket)
