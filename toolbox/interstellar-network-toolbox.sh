@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Supports Debian and Ubuntu.
 # Start without arguments for the interactive menu.
 
-TOOLBOX_VERSION="4.6.2"
+TOOLBOX_VERSION="4.6.3"
 BACKUP_DIR="/var/backups/interstellar-toolbox"
 SSH_DROPIN="/etc/ssh/sshd_config.d/99-interstellar-hardening.conf"
 MANAGER_INSTALL_PATH="/usr/local/sbin/interstellar-toolbox"
@@ -1922,9 +1922,12 @@ def virtualization() -> str:
     return container_type() or "none"
 
 
+CONTAINER_TYPES = {"lxc", "lxc-libvirt", "docker", "podman", "systemd-nspawn",
+                   "container-other", "rkt", "openvz"}
+
+
 def is_container() -> bool:
-    return virtualization() in {"lxc", "lxc-libvirt", "docker", "podman", "systemd-nspawn",
-                                "container-other", "rkt", "openvz"}
+    return virtualization() in CONTAINER_TYPES
 
 
 def cpu_model() -> str | None:
@@ -2688,15 +2691,31 @@ def minimal_health() -> dict[str, Any]:
     expected_healthy = stats.get("service_policy", {}).get("healthy", True)
     ntp = stats.get("time", {}).get("synchronized")
     collector_errors = stats.get("collector_errors", {})
-    healthy = (
-        failures == 0
-        and expected_healthy
-        and ntp is not False
-        and (root_used is None or root_used < 95)
-        and not collector_errors
-    )
+    in_container = stats.get("host", {}).get("virtualization") in CONTAINER_TYPES
+
+    # Say why, in the response. "degraded" with no reason forces whoever is
+    # holding the pager to go read /stats and guess which rule tripped.
+    reasons: list[str] = []
+    if collector_errors:
+        reasons.append("collectors failed: " + ", ".join(sorted(collector_errors)))
+    if failures:
+        reasons.append(f"{failures} failed systemd unit(s)")
+    if not expected_healthy:
+        problems = [problem.get("service") for problem
+                    in stats.get("service_policy", {}).get("problems", [])]
+        named = ", ".join(name for name in problems if name)
+        reasons.append(f"expected services not active: {named}" if named
+                       else "expected services not active")
+    if ntp is False and not in_container:
+        # A container does not own the clock; the host synchronizes it.
+        reasons.append("clock is not NTP synchronized")
+    if root_used is not None and root_used >= 95:
+        reasons.append(f"root filesystem is {root_used}% full")
+
+    healthy = not reasons
     return {
         "status": "ok" if healthy else "degraded",
+        "degraded_reasons": reasons,
         "collector_errors": collector_errors,
         "agent_version": VERSION,
         "timestamp_utc": stats["timestamp_utc"],
@@ -4917,23 +4936,46 @@ agent_local_url() {
   printf 'http://127.0.0.1:%s' "$port"
 }
 
-agent_test_health() {
-  local url
+# Prints the status line and the body. Never uses curl --fail: it suppresses the
+# response body, so a 503 that explains itself in JSON arrives as an empty pipe
+# and `json.tool` reports "Expecting value: line 1 column 1". --fail-with-body
+# would keep it but needs curl 7.76, and Debian 11 ships 7.74.
+agent_http_probe() {
+  local path="$1" url response body code status=0
   url="$(agent_local_url)"
-  curl -fsS "${url}/health" | python3 -m json.tool
+  response="$(curl -sS -w $'\n%{http_code}' "${url}${path}" 2>&1)" || status=$?
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  if [[ "$status" -ne 0 || "$code" == "000" ]]; then
+    warn "Could not reach ${url}${path}"
+    if [[ -n "$body" ]]; then
+      printf '%s\n' "$body"
+    fi
+    warn "Is the agent running? systemctl status interstellar-agent"
+    return 1
+  fi
+  printf 'GET %s%s -> HTTP %s\n\n' "$url" "$path" "$code"
+  printf '%s' "$body" | python3 -m json.tool 2>/dev/null || printf '%s\n' "$body"
+  case "$code" in
+    2*) ;;
+    503)
+      echo
+      warn "The agent is running and answered; it reports the host as degraded."
+      warn "See degraded_reasons above."
+      ;;
+    *)
+      echo
+      warn "Unexpected HTTP ${code}."
+      return 1
+      ;;
+  esac
 }
 
-agent_test_stats() {
-  local url
-  url="$(agent_local_url)"
-  curl -fsS "${url}/stats" | python3 -m json.tool
-}
+agent_test_health() { agent_http_probe /health; }
 
-agent_test_metrics() {
-  local url
-  url="$(agent_local_url)"
-  curl -fsS "${url}/metrics"
-}
+agent_test_stats() { agent_http_probe /stats; }
+
+agent_test_metrics() { agent_http_probe /metrics; }
 
 agent_toggle_public_health() {
   ui_msg "Removed" "Static bearer-token authentication was removed in Toolbox v4.\nUse Tailscale Serve and tailnet identity/policy instead."
@@ -4988,9 +5030,9 @@ agent_menu() {
       7) clear; agent_disable_tailscale_serve; pause ;;
       8) clear; agent_enable_discovery; pause ;;
       9) clear; agent_disable_discovery; pause ;;
-      10) clear; agent_test_health; pause ;;
-      11) clear; agent_test_stats; pause ;;
-      12) clear; agent_test_metrics; pause ;;
+      10) clear; agent_test_health || true; pause ;;
+      11) clear; agent_test_stats || true; pause ;;
+      12) clear; agent_test_metrics || true; pause ;;
       13) agent_security_model ;;
       14) systemctl restart interstellar-agent interstellar-control-api interstellar-control-helper; ui_msg "API" "Agents restarted." ;;
       15) clear; agent_uninstall; pause ;;
